@@ -10,9 +10,15 @@
   7. 体积闸门：超限时必须拒绝发送并说明原因（而不是发出去撞协议端上限）
   8. 自动降档：16k wav 超限时自动降到 8k 重转后仍能发出
   9. 加载 main.py：装饰器注册齐全、音源发现正常、「点歌」「音乐状态」两条命令真跑通
+ 10. 去重闸门：同一会话内重复请求只发一遍，且关掉去重后能正常「再放一遍」
+ 10. 去重闸门：同一会话内、同一首歌连续发两次，第二次必须被跳过；换个会话则不受影响
 
 第 9 条单独存在的理由：前 8 条只覆盖 core/，main.py 一行都没被执行过。如果入口的
 装饰器签名或相对导入有问题，部署到服务器上只会看到一句泛泛的加载失败，很难定位。
+
+第 10 条针对的是「同一首歌发两遍」：AstrBot 的 session_waiter 截获消息后会把它
+浅复制成新事件重新投递一遍，那条消息同样会触发 LLM；LLM 看到「候选列表 + 1 语音」
+的上下文，可能又调用一次点歌工具。所以发送层必须自己认得出「这首刚发过」。
 
 第 7、8 条针对的是「总是超时 + 最后发出来是个文件」这个症状：
 本地语音会被 AstrBot 转成 wav 再 base64 塞进**一条** WebSocket 帧，
@@ -237,7 +243,10 @@ async def main() -> int:
         print("    ✓ 回退生效，未长时间挂起")
 
     # --- 2. 下载 + 魔数校验 ---
-    if songs:
+    # 后面的用例都依赖这一步的产物，所以先声明好、失败就整段跳过，
+    # 不要拿 None 去做 Path(None) —— 那是脚本自己崩，不是被测代码有问题。
+    path: Path | None = None
+    if songs and songs[0].audio_url:
         path = await dl.download_audio(
             songs[0].audio_url, headers=player.audio_headers(songs[0])
         )
@@ -245,8 +254,11 @@ async def main() -> int:
             print(f"\n[2] 下载成功 {path.name}（{path.stat().st_size} 字节）")
             print(f"    ✓ 校验为有效音频：{is_valid_audio(path)}")
         else:
-            print("\n[2] ✗ 下载失败")
+            print("\n[2] ✗ 下载失败（音源端抽风？后续依赖下载的用例会跳过）")
             ok = False
+    elif songs:
+        print("\n[2] ✗ 搜索结果的 audio_url 为空，跳过下载用例")
+        ok = False
 
     # --- 3. 反例：HTML 必须被拒绝 ---
     bad = await dl.download_audio("https://www.baidu.com")
@@ -274,7 +286,8 @@ async def main() -> int:
         print("    ✗ PATH 垫片未生效（AstrBot 内部发语音仍会失败）")
         ok = False
 
-    if songs:
+    voice = wav = None
+    if path:
         # auto 模式：必须是 wav，不能是 mp3。
         # 走 record_local 时 AstrBot 会把 target_format 写死成 wav，
         # 给它 mp3 只会被重新膨胀成 44.1kHz 立体声 wav（体积涨 5 倍）。
@@ -430,13 +443,20 @@ async def main() -> int:
         ok = False
 
     class _FakeMsgEvent:
-        """够 on_song 用即可。"""
+        """够 on_song / send_song 用即可。"""
 
-        def __init__(self, text: str):
+        def __init__(self, text: str, umo: str = "aiocqhttp:GroupMessage:10086"):
             self.message_str = text
             self.is_at_or_wake_command = True
+            # 去重闸门的 key 会用到会话标识，所以它得是个稳定值
+            self.unified_msg_origin = umo
             self.sent: list = []
             self.stopped = False
+            self.call_llm: bool | None = None
+
+        def should_call_llm(self, call_llm: bool) -> None:
+            """记录 LLM 开关，供断言「有没有掐掉 LLM」使用。"""
+            self.call_llm = call_llm
 
         def get_platform_name(self):
             return "aiocqhttp"
@@ -478,6 +498,11 @@ async def main() -> int:
         else:
             print(f"    ✗ 命令没走通（sent={len(ev9.sent)}, stopped={ev9.stopped}）")
             ok = False
+    if ev9.call_llm is False:
+        print("    ✓ 已用 should_call_llm(False) 掐掉 LLM 链路（防重复发送的关键）")
+    else:
+        print(f"    ✗ 没有禁止 LLM（call_llm={ev9.call_llm}），同一首歌可能被发两遍")
+        ok = False
 
     ev9b = _FakeMsgEvent("音乐状态")
     try:
@@ -491,6 +516,78 @@ async def main() -> int:
         else:
             print("    ✗ 「音乐状态」没输出报告")
             ok = False
+
+    # --- 10. 去重闸门（治「同一首歌发两遍」）---
+    # 症状：用户回了「1 语音」，插件发了一遍，隔了 20 多秒又发一遍，两条日志一模一样。
+    # 根因：AstrBot 的 session_waiter 截获消息后会把它 **浅复制成新事件重新投递一遍**，
+    #       那条消息同样会触发 LLM；LLM 看到「候选列表 + 1 语音」的上下文，
+    #       很可能判断用户想听第 1 首，于是又调用了一次点歌工具。
+    # 三层防线：① should_call_llm(False)（治本，第 9 条已断言）
+    #           ② event.stop_event()（挡后续 listener）
+    #           ③ 发送层的去重闸门（兜底，本组验证）
+    # 注意：这里用独立的 sender 和独立会话标识，否则会被第 9 条留下的去重记录误伤。
+    print("\n[10] 去重闸门")
+    found = await player.fetch_songs("晴天", limit=1)
+    if not found or not found[0].audio_url:
+        print("    ✗ 没搜到可用歌曲，本组跳过（多半是音源端抽风，不是代码问题）")
+        found = None
+    if found is None:
+        await plugin.terminate()
+        await http.close()
+        print("\n" + "=" * 62)
+        print("自测结果：" + ("全部通过 ✓" if ok else "存在失败项 ✗"))
+        print("=" * 62)
+        return 0 if ok else 1
+
+    song0 = found[0]
+    print(f"    用例歌曲：{song0.display_name()}（id={song0.id}）")
+
+    GROUP = "aiocqhttp:GroupMessage:70001"
+    OTHER = "aiocqhttp:GroupMessage:70002"
+    d_raw = dict(raw)
+    d_raw["dedup_seconds"] = 20
+    sender_d = MusicSender(PluginConfig(d_raw, None), dl)
+
+    # 10a. 同一会话内同一首歌连发两次 -> 第二次必须被跳过
+    ev10a = _FakeMsgEvent("点歌 晴天 1", GROUP)
+    await sender_d.send_song(ev10a, player, song0)
+    n1 = len(ev10a.sent)
+    ev10b = _FakeMsgEvent("点歌 晴天 1", GROUP)
+    await sender_d.send_song(ev10b, player, song0)
+    n2 = len(ev10b.sent)
+    print(f"    同会话第 1 次发出 {n1} 条，第 2 次发出 {n2} 条（期望 1 / 0）")
+    if n1 == 1 and n2 == 0:
+        print("    ✓ 重复发送被拦截，同一首歌只会发一遍")
+    else:
+        print("    ✗ 去重失效，同一首歌还是会被发两遍")
+        ok = False
+
+    # 10b. 换个会话 -> 必须照常发送，不能误伤别的群
+    ev10c = _FakeMsgEvent("点歌 晴天 1", OTHER)
+    await sender_d.send_song(ev10c, player, song0)
+    print(f"    换会话再点同一首：发出 {len(ev10c.sent)} 条（期望 1）")
+    if len(ev10c.sent) == 1:
+        print("    ✓ 去重按会话隔离，别的群/私聊不受影响")
+    else:
+        print("    ✗ 误伤了其他会话")
+        ok = False
+
+    # 10c. dedup_seconds=0 -> 开关确实能关掉（保留「我就想再放一遍」的用法）
+    off_raw = dict(raw)
+    off_raw["dedup_seconds"] = 0
+    sender_off = MusicSender(PluginConfig(off_raw, None), dl)
+    ev10d = _FakeMsgEvent("点歌 晴天 1", GROUP)
+    await sender_off.send_song(ev10d, player, song0)
+    ev10e = _FakeMsgEvent("点歌 晴天 1", GROUP)
+    await sender_off.send_song(ev10e, player, song0)
+    print(
+        f"    dedup_seconds=0 时连发两次：{len(ev10d.sent)} + {len(ev10e.sent)} 条（期望 1 + 1）"
+    )
+    if ev10d.sent and ev10e.sent:
+        print("    ✓ 开关有效，设 0 即可完全关闭去重")
+    else:
+        print("    ✗ 去重关不掉")
+        ok = False
 
     await plugin.terminate()
 

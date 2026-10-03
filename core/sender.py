@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import traceback
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -43,6 +44,42 @@ class MusicSender:
     def __init__(self, cfg: PluginConfig, downloader: Downloader):
         self.cfg = cfg
         self.downloader = downloader
+        # 去重窗口：key -> 上次发送的 monotonic 时间戳
+        self._recent: dict[str, float] = {}
+
+    # ------------------------------------------------------------------
+    # 去重闸门
+    #
+    # 为什么需要这一道：AstrBot 的 session_waiter 截获一条消息后，会把它
+    # **浅复制成一个新事件重新投递，走一遍完整流水线**，那条消息同样会触发
+    # LLM 回复。LLM 看到「候选列表 + 1 语音」这种上下文，很可能认为用户想听
+    # 第 1 首，于是又调用一次本插件的点歌工具 —— 同一首歌就发了两遍，
+    # 而且两条日志长得一模一样，很难看出是两条不同路径。
+    # ------------------------------------------------------------------
+    def _dedup_key(self, event: AstrMessageEvent, song: Song) -> str | None:
+        if self.cfg.dedup_seconds <= 0:
+            return None
+        try:
+            umo = event.unified_msg_origin
+        except AttributeError:
+            return None
+        if not umo:
+            return None
+        return f"{umo}|{song.source or ''}|{song.id or song.name or ''}"
+
+    def _hit_dedup(self, key: str) -> float | None:
+        """命中返回「距今多少秒」，未命中返回 None。"""
+        window = self.cfg.dedup_seconds
+        now = time.monotonic()
+        # 顺手清理过期项，避免长跑后字典无限增长
+        self._recent = {k: t for k, t in self._recent.items() if now - t < window}
+        last = self._recent.get(key)
+        return None if last is None else now - last
+
+    def _release_dedup(self, key: str | None) -> None:
+        """彻底失败时把占位撤回，否则用户 20 秒内重试会被静默吞掉。"""
+        if key:
+            self._recent.pop(key, None)
 
     # ------------------------------------------------------------------
     # 各发送方式：成功 -> None，失败 -> 原因
@@ -252,6 +289,19 @@ class MusicSender:
         modes: list[str] | None = None,
     ) -> bool:
         """按策略发送一首歌。返回是否成功。"""
+        # 0) 去重闸门（见上面 _dedup_key 的注释）
+        dedup_key = self._dedup_key(event, song)
+        if dedup_key:
+            ago = self._hit_dedup(dedup_key)
+            if ago is not None:
+                logger.info(
+                    f"[sender] 去重命中：{song.display_name()} 在 {ago:.1f}s 前刚发过，"
+                    f"本次跳过（窗口 {self.cfg.dedup_seconds}s，"
+                    f"设 dedup_seconds=0 可关闭）"
+                )
+                return True
+            self._recent[dedup_key] = time.monotonic()
+
         # 1) 补全音频直链：先走平台解析钩子，再收集候选地址
         if not song.audio_url:
             try:
@@ -261,6 +311,7 @@ class MusicSender:
 
         urls = player.audio_url_candidates(song)
         if not urls:
+            self._release_dedup(dedup_key)
             await event.send(
                 event.plain_result(f"【{song.display_name()}】获取音频直链失败")
             )
@@ -273,7 +324,7 @@ class MusicSender:
         if self.cfg.voice_strict and modes is None:
             target = [m for m in target if m.startswith("record")] or ["record_local"]
 
-        logger.debug(
+        logger.info(
             f"[sender] {event.get_sender_name()} 点歌 "
             f"{player.platform.display_name} -> {song.display_name()}，"
             f"候选方式：{target}"
@@ -298,9 +349,12 @@ class MusicSender:
             if reason is None:
                 logger.info(f"[sender] {mode} 发送成功：{song.display_name()}")
                 return True
-            logger.debug(f"[sender] {mode} 失败：{reason}")
+            # 用 INFO 而不是 DEBUG：排查「为什么最后发了文件」时必须看到
+            # 前面那些方式各自失败在哪一步（record_link 拉不到直链是最常见的）
+            logger.info(f"[sender] {mode} 失败：{reason}")
             reasons.append(f"{mode}：{reason}")
 
         # 4) 全部失败，给出可诊断的信息，而不是静默发个文件
+        self._release_dedup(dedup_key)
         await event.send(event.plain_result(self._fail_text(song, target, reasons)))
         return False

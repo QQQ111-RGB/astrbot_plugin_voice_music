@@ -38,6 +38,7 @@ AstrBot 侧表现为「超时」，然后插件降级去发文件，你就收到
 |---|---|---|
 | 总是显示超时 | ① `aiohttp.ClientSession()` 默认总超时 **300 秒**，接口挂住就一直等；② 公共音源域名时好时坏，单点无备用；③ **语音那一条 WebSocket 帧太大，协议端直接断连**，AstrBot 等不到回包 → 报超时（见下面第二节） | `core/http.py`：秒级三级超时 + 有限重试 + **多端点自动回退**；`core/sender.py` **体积闸门**（超限不发，先自动降档） |
 | 想要语音却发来文件 | ① 下载到的其实是 HTML 错误页，被当成 mp3；② 语音环节失败后**静默降级**到 file，file 不校验内容所以「成功」了；③ 超时的连带后果 —— 语音发不出去就退到 file | `core/downloader.py` 魔数校验；`core/audio.py` 转码 + PATH 垫片；`core/sender.py` **严格语音模式，失败直接报错不降级** |
+| 同一首歌发两遍 | 会话截获的那条回复会被 AstrBot **浅复制后重新投递**、再走一遍流水线触发 LLM，LLM 于是又调了一次点歌工具（见下面第 4 节） | `main.py` 的 `should_call_llm(False)`（治本）；`core/sender.py` 的**去重窗口**（兜底） |
 | 服务器上没法排查 | Docker 里不方便随手开终端 | `core/diagnose.py`：发「**音乐状态**」输出自检报告 |
 
 ---
@@ -120,6 +121,42 @@ RangeError: Max payload size exceeded
 
 > 顺带一提：作者在 issue #67/#68 里提过 `napcat_record_source`（`base64`/`url`/`local_file` 三选一）
 > 来解决这件事，但 **PR #68 至今是 closed、未合并**，main 分支上没有这个配置项 —— 别去配置里找它。
+
+### 4. 为什么同一首歌会发两遍
+
+现象：回了个序号，歌发出来了，**过十几二十秒又发了一遍**。两条日志一模一样：
+
+```
+[astrbot_plugin_voice_music] [core.sender] record_local 发送成功：...
+[astrbot_plugin_voice_music] [core.sender] record_local 发送成功：...   ← 24 秒后又来一次
+```
+
+根因不在本插件，在 AstrBot 的会话机制：
+
+`session_waiter` 截获一条消息（这里是用户的「1 语音」）后，**会把它浅复制成一个新事件，
+重新投递走一遍完整流水线**。那条消息于是又触发了一次 LLM 回复 ——
+而 LLM 看到的上下文是「候选列表 + 用户回复的 1 语音」，它很自然判断出用户想听第 1 首，
+**于是调用本插件的点歌工具再发一次**。
+
+两个关键点，都反直觉：
+
+1. **`event.stop_event()` 挡不住它。** 它只阻止事件向后续 listener / handler 传播，
+   而 LLM 请求是由另一个开关控制的 —— `event.should_call_llm(False)`。
+2. **两条日志长得一样，所以看不出是两条路径。** 命令路径用的是你指定的 `record_local`；
+   LLM 工具路径用的是默认链（`record_link` 先试，拉不到直链再退到 `record_local`），
+   最后落在同一个 `record_local 发送成功` 上。这也是排查时最容易卡住的地方。
+
+本插件的两道对策：
+
+- **`main.py` 的 `_no_llm()`**：一旦确认消息属于本插件（`点歌 ...` 或选歌回复），
+  立刻 `event.should_call_llm(False)` —— 从源头掐掉 LLM，不让它有机会再点一次。
+- **`core/sender.py` 的去重窗口**（`dedup_seconds`，默认 20 秒）：
+  同一会话内、同一首歌在窗口内只发一次。这是兜底，不依赖上面那条能不能生效。
+
+> 想在窗口内「再放一遍」？把 `dedup_seconds` 设成 `0` 就关掉了。
+> 另外 `sender.py` 里每种发送方式的失败原因现在用 **INFO** 级别记录，
+> 所以你会在日志里看到完整链路（`record_link 失败：... → record_local 发送成功`），
+> 而不是只有一个孤零零的成功 —— 这正是上面第 2 点难查的原因。
 
 ---
 
@@ -379,6 +416,7 @@ docker logs <容器名> 2>&1 | grep voice_music | tail -20
 | `ffmpeg_convert` | `true` | 发送前用 ffmpeg 转码 |
 | `voice_format` | `auto` | `auto`＝`wav`(16kHz 单声道)。可选 `wav8k`（体积减半）/ `mp3`（**别配给 record_local**，会被 AstrBot 放大 5 倍） |
 | `max_payload_bytes` | `8388608`（8 MiB） | **单帧体积闸门**。超限先自动降档一次，仍超就拒绝发送并报出具体数字。填 `0` 不限制 |
+| `dedup_seconds` | `20` | **同一会话内同一首歌的去重窗口**，治「同一首歌发两遍」。填 `0` 关闭 |
 | `max_voice_seconds` | 600 | 超长音频截断，避免发送失败 |
 | `proxy` | 空 | 容器里填宿主机代理要写 `http://172.17.0.1:7890` |
 
@@ -428,9 +466,14 @@ python .selftest/run_selftest.py
 - **自动降档**：16k 预计 11.4 MB、8k 预计 5.7 MB，上限卡在中间时自动降到 wav8k 并成功发出
 - **`main.py` 能被加载**：相对导入正常、命令 / 事件监听 / LLM 工具三类钩子全部注册，
   音源自动发现到 2 个，并且 `点歌 晴天 1` 与 `音乐状态` 两条命令都真跑了一遍
+- **LLM 链路已被掐掉**：`点歌` 与选歌回复都会调 `should_call_llm(False)`，
+  这是防「同一首歌发两遍」最关键的一层（第 9 条断言 `call_llm is False`）
+- **去重闸门**：同一会话内同一首歌连发两次，第二次被拦下（只发出 1 条）；
+  换个会话点同一首则正常发出（不误伤别的群）；`dedup_seconds = 0` 时去重完全关闭
 
 > 第 9 条是专门为「部署到服务器」加的：前 8 条只覆盖 `core/`，
 > 入口文件如果装饰器签名或相对导入有问题，你在服务器上只会看到一句泛泛的加载失败。
+> 第 10 条针对的是运行期才会暴露的「同一首歌发两遍」—— 见第一节的「4. 为什么同一首歌会发两遍」。
 
 真实跑出来的数字（`晴天` 那首 11.2 MB 的 mp3）：
 

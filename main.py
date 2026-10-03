@@ -42,6 +42,27 @@ COMMAND_ALIAS = {"网易点歌", "网易云", "网易web", "网易官方"}
 STATUS_ALIAS = {"点歌诊断", "音乐诊断", "音乐状态"}
 
 
+def _no_llm(event: AstrMessageEvent) -> None:
+    """禁止这条消息再走 AstrBot 默认的 LLM 链路。
+
+    ★ 为什么必须有这一步（真实踩过的坑）：
+
+    AstrBot 的 session_waiter 截获一条消息后，会把它 **浅复制成一个新事件，
+    重新投递走一遍完整流水线**。那条消息同样会触发 LLM 回复 —— 而 LLM 看到的上下文是
+    「候选列表 + 用户回复的 1 语音」，它很可能判断用户想听第 1 首，
+    于是再调用一次本插件的点歌工具，**同一首歌就发了两遍**。
+    两遍的日志长得一模一样（都是 record_local 发送成功），极难定位。
+
+    `event.stop_event()` 挡不住这件事：它只影响后续的 listener/handler 传播，
+    LLM 请求由 `should_call_llm()` 单独控制。
+    """
+    try:
+        event.should_call_llm(False)
+    except Exception:  # noqa: BLE001
+        # 老版本 AstrBot 可能没有这个方法；退化成不做任何事，不影响主流程
+        pass
+
+
 class VoiceMusicPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -167,6 +188,9 @@ class VoiceMusicPlugin(Star):
         if player is None:
             return  # 不是本插件的命令，静默放过
 
+        # 确认是我们自己的命令：接管这条消息，别再让它触发 LLM
+        _no_llm(event)
+
         # 解析「歌名 + 可选尾部序号」
         parts = arg.split()
         index = int(parts[-1]) if parts[-1].isdigit() else 0
@@ -213,6 +237,10 @@ class VoiceMusicPlugin(Star):
         async def selection_waiter(
             controller: SessionController, ev: AstrMessageEvent
         ):
+            # ★ 这条消息是被会话截获的，AstrBot 之后还会把它浅复制重新投递一次
+            #   （见 _no_llm 的注释）。在这里就掐掉 LLM，否则会重复发一遍歌。
+            _no_llm(ev)
+
             text = ev.message_str.strip()
             # 用户又发起了新的点歌：让给新会话
             if any(kw in text.lower() for kw in self.keywords):
@@ -265,4 +293,9 @@ class VoiceMusicPlugin(Star):
         if not songs:
             return "没找到相关歌曲"
         ok = await self.sender.send_song(event, player, songs[0])
+        # 歌已经发出去了，就别再让 LLM 补一句「好的，这就为你播放」之类的废话，
+        # 也顺手挡掉其他插件对同一条消息的重复响应。
+        # 注意：真正防「同一首歌发两遍」的是 sender 里的去重闸门（dedup_seconds），
+        # stop_event 只作用于当前这条事件的后续 listener，挡不住被重新投递的那条。
+        event.stop_event()
         return None if ok else "歌曲发送失败（详见聊天里的失败原因）"

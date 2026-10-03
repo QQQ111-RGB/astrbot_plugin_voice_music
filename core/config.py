@@ -113,6 +113,24 @@ class PluginConfig:
         return int(self.raw.get("max_voice_seconds") or 0)
 
     @property
+    def dedup_seconds(self) -> int:
+        """同一会话内、同一首歌的发送去重窗口（秒）。0 表示关闭。
+
+        为什么需要：AstrBot 的 session_waiter 截获消息后，会把它浅复制成新事件
+        **重新投递走一遍完整流水线**，那条消息会触发 LLM 回复；LLM 看到
+        「候选列表 + 1 语音」这样的上下文，很可能又调用一次本插件的点歌工具，
+        于是同一首歌发两遍。见 README 的「为什么同一首歌会发两遍」。
+        """
+        value = self.raw.get("dedup_seconds")
+        if value is None or value == "":
+            return 20
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 20
+        return parsed if parsed > 0 else 0
+
+    @property
     def max_payload_bytes(self) -> int:
         """本地语音发出前的 base64 体积闸门（字节）。<=0 表示不限制。
 

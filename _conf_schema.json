@@ -115,6 +115,28 @@
         "type": "int",
         "default": 8388608
     },
+    "dedup_seconds": {
+        "description": "同一首歌去重窗口（秒）",
+        "hint": "★解决「同一首歌发两遍」。AstrBot 的选歌等待器截获你的消息后会把它重新投递一遍、再触发一次 LLM，LLM 可能顺手又点一次歌。此窗口内同一会话里的同一首歌只会发一次。0 = 关闭去重",
+        "type": "int",
+        "slider": {
+            "min": 0,
+            "max": 120,
+            "step": 5
+        },
+        "default": 20
+    },
+    "dedup_seconds": {
+        "description": "同一首歌的去重窗口（秒）",
+        "hint": "★治「同一首歌发两遍」。AstrBot 的会话机制会把被截获的回复消息浅复制后重新投递一遍，那条消息仍会触发 LLM，LLM 可能又调用一次点歌工具。窗口内同会话同一首歌只发一次。填 0 关闭",
+        "type": "int",
+        "slider": {
+            "min": 0,
+            "max": 120,
+            "step": 5
+        },
+        "default": 20
+    },
     "max_voice_seconds": {
         "description": "语音最长时长（秒）",
         "hint": "超过该时长的音频会被截断，避免超长语音发送失败。0 表示不限制",
