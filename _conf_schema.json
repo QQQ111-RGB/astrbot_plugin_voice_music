@@ -1,0 +1,146 @@
+{
+    "default_player_name": {
+        "description": "默认点歌平台",
+        "hint": "「点歌 歌名」时默认使用的平台。也可用平台命令直接指定：网易点歌 / QQ点歌",
+        "type": "string",
+        "options": [
+            "网易点歌",
+            "QQ点歌"
+        ],
+        "default": "网易点歌"
+    },
+    "source_endpoints": {
+        "description": "音源接口地址（多端点自动回退）",
+        "hint": "★解决超时/失效的关键。按顺序尝试，一个不通立刻换下一个。下面两个是实测可用的公开端点，建议自行部署 Meting 后替换",
+        "type": "list",
+        "default": [
+            "https://api.qijieya.cn/meting/",
+            "https://api.i-meto.com/meting/api"
+        ]
+    },
+    "request_timeout": {
+        "description": "单次请求超时（秒）",
+        "hint": "★解决「卡很久才超时」的关键。aiohttp 默认总超时长达 5 分钟，这里收紧到秒级",
+        "type": "int",
+        "slider": {
+            "min": 3,
+            "max": 30,
+            "step": 1
+        },
+        "default": 8
+    },
+    "request_retries": {
+        "description": "失败重试次数",
+        "hint": "单端点内的重试次数（指数退避）。配合多端点回退使用",
+        "type": "int",
+        "slider": {
+            "min": 0,
+            "max": 5,
+            "step": 1
+        },
+        "default": 2
+    },
+    "song_limit": {
+        "description": "搜索返回歌曲数量",
+        "type": "int",
+        "slider": {
+            "min": 1,
+            "max": 20,
+            "step": 1
+        },
+        "default": 5
+    },
+    "selection_timeout": {
+        "description": "选歌等待超时（秒）",
+        "hint": "发出候选列表后，用户在此时间内不回复序号即自动取消，避免出现「点歌超时！」",
+        "type": "int",
+        "slider": {
+            "min": 15,
+            "max": 300,
+            "step": 5
+        },
+        "default": 60
+    },
+    "send_modes": {
+        "description": "发送方式优先级",
+        "hint": "★决定发语音还是发文件。排在前面的优先，失败自动尝试下一种。要「只发语音」就把 file_* 去掉。默认把 record_link 放第一：它只把音频直链递过去（一帧几十字节），由协议端自己去下载，不会撞上协议端的单帧体积上限；record_local 要把整首歌 base64 塞进一帧，很容易触发 NapCat 的 Max payload size exceeded，表现为超时后降级发文件",
+        "type": "list",
+        "options": [
+            "record_link(语音链接)",
+            "record_local(本地语音)",
+            "file_local(本地文件)",
+            "file_link(文件链接)",
+            "text(文本模式)"
+        ],
+        "default": [
+            "record_link(语音链接)",
+            "record_local(本地语音)",
+            "file_local(本地文件)",
+            "text(文本模式)"
+        ]
+    },
+    "voice_strict": {
+        "description": "严格语音模式（不降级成文件）",
+        "hint": "★开启后：语音发送失败时直接报错并说明原因，不再静默退回发文件。排查/追求语音体验时建议开启",
+        "type": "bool",
+        "default": true
+    },
+    "ffmpeg_convert": {
+        "description": "发送前用 ffmpeg 转码",
+        "hint": "★解决「语音发不出去」的关键。把下载到的音频统一成单声道低采样率 wav —— AstrBot 见到 .wav 会直接复用、不再自己转码，因此线上体积由本插件说了算",
+        "type": "bool",
+        "default": true
+    },
+    "ffmpeg_path": {
+        "description": "ffmpeg 可执行文件路径",
+        "hint": "留空或填 ffmpeg 表示从 PATH 查找。Docker 部署一般不用改；若用了 imageio-ffmpeg，插件会自动建 PATH 垫片",
+        "type": "string",
+        "default": "ffmpeg"
+    },
+    "voice_format": {
+        "description": "语音转码格式",
+        "hint": "auto = wav(16kHz 单声道，推荐)。wav8k = 8kHz，体积再减半，音质发闷，直链慢或协议端上限小时用。mp3 体积小但只对 record_link / file_* 有意义 —— 走 record_local 时 AstrBot 会把它重新膨胀成 44.1kHz 立体声 wav，反而大 5 倍",
+        "type": "string",
+        "options": [
+            "auto",
+            "wav",
+            "wav8k",
+            "mp3"
+        ],
+        "default": "auto"
+    },
+    "max_payload_bytes": {
+        "description": "本地语音体积上限（字节）",
+        "hint": "★本地语音会被 AstrBot 转成 wav 再 base64 塞进一条 WebSocket 帧。超过协议端 maxPayload 时连接会被断开，AstrBot 报超时、插件降级发文件。默认 8 MiB；超限时会先自动降到 wav8k 重试一次，仍超则拒绝发送并说明原因。填 0 表示不限制",
+        "type": "int",
+        "default": 8388608
+    },
+    "max_voice_seconds": {
+        "description": "语音最长时长（秒）",
+        "hint": "超过该时长的音频会被截断，避免超长语音发送失败。0 表示不限制",
+        "type": "int",
+        "slider": {
+            "min": 0,
+            "max": 1800,
+            "step": 30
+        },
+        "default": 600
+    },
+    "record_unsupported": {
+        "description": "不支持发语音的消息平台",
+        "hint": "填写平台名（如 telegram、discord）。留空表示所有平台都尝试发语音",
+        "type": "list",
+        "default": []
+    },
+    "proxy": {
+        "description": "HTTP 代理",
+        "hint": "如 http://127.0.0.1:7890，留空则直连",
+        "type": "string",
+        "default": ""
+    },
+    "recall_select": {
+        "description": "点歌成功后撤回候选列表",
+        "type": "bool",
+        "default": true
+    }
+}

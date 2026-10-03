@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 插件运行时产物
+data/
+plugin_data/
+*.log
+
+# 自测/体检产生的音频（在系统临时目录里，这里兜个底）
+.selftest/tmp/
+wb_voice_music_selftest/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.amr
+*.silk
+
+# 从 AstrBot 源码摘出来做参考的副本 —— 属于第三方代码，不随本仓库分发
+.ref/
+
+# 本机私有笔记 / WorkBuddy 记忆
+.workbuddy/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

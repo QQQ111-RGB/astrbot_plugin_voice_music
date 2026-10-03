@@ -1,0 +1,4 @@
+aiohttp>=3.9.0
+aiofiles>=23.2.0
+# 可选：若系统未安装 ffmpeg，装这个包可让插件自动使用其自带的 ffmpeg 二进制
+# imageio-ffmpeg>=0.4.9
