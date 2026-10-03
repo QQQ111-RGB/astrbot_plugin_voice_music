@@ -4,4 +4,4 @@ desc: 语音优先的点歌插件。多音源自动回退、请求超时可控�
 help: 点歌 <歌名> [序号]；回复序号选歌，可加「语音 / 文件 / 文本」指定发送方式。发「音乐状态」查看自检报告
 version: v0.3.1
 author: aqi
-repo: ""
+repo: https://github.com/QQQ111-RGB/astrbot_plugin_voice_music
