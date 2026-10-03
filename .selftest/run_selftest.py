@@ -530,8 +530,6 @@ async def main() -> int:
     found = await player.fetch_songs("晴天", limit=1)
     if not found or not found[0].audio_url:
         print("    ✗ 没搜到可用歌曲，本组跳过（多半是音源端抽风，不是代码问题）")
-        found = None
-    if found is None:
         await plugin.terminate()
         await http.close()
         print("\n" + "=" * 62)
