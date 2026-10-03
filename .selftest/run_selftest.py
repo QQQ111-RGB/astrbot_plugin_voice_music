@@ -10,15 +10,25 @@
   7. 体积闸门：超限时必须拒绝发送并说明原因（而不是发出去撞协议端上限）
   8. 自动降档：16k wav 超限时自动降到 8k 重转后仍能发出
   9. 加载 main.py：装饰器注册齐全、音源发现正常、「点歌」「音乐状态」两条命令真跑通
- 10. 去重闸门：同一会话内重复请求只发一遍，且关掉去重后能正常「再放一遍」
- 10. 去重闸门：同一会话内、同一首歌连续发两次，第二次必须被跳过；换个会话则不受影响
+ 10. QQ 音乐音源：TencentMeting 被自动注册，搜索 / id 解析 / 取直链都走得通
+ 11. 去重闸门：同一会话内同一首歌连续发两次，第二次必须被跳过；换个会话则不受影响
+ 12. 自建 Meting-API 的取链签名：meting_token 能生成正确的 auth=HMAC-SHA1(server+type+id)
 
 第 9 条单独存在的理由：前 8 条只覆盖 core/，main.py 一行都没被执行过。如果入口的
 装饰器签名或相对导入有问题，部署到服务器上只会看到一句泛泛的加载失败，很难定位。
 
-第 10 条针对的是「同一首歌发两遍」：AstrBot 的 session_waiter 截获消息后会把它
+第 10 条针对的是「提示无可用音源」：_conf_schema.json 的 default_player_name 一直
+提供「QQ点歌」选项，但仓库里根本没有 QQ 音源，get_player() 匹配不到就返回 None，
+LLM 工具路径直接回一句「无可用音源」。现在补上 TencentMeting 并断言它真能走通。
+
+第 11 条针对的是「同一首歌发两遍」：AstrBot 的 session_waiter 截获消息后会把它
 浅复制成新事件重新投递一遍，那条消息同样会触发 LLM；LLM 看到「候选列表 + 1 语音」
 的上下文，可能又调用一次点歌工具。所以发送层必须自己认得出「这首刚发过」。
+
+第 12 条针对的是「搜得到歌、一取直链就 401」：要把 QQ 音乐放稳的正路是自建
+metowolf/Meting-API 并注入 QQ 音乐 Cookie，而该服务对 url/pic/lrc 强制校验
+auth=HMAC-SHA1(METING_TOKEN, server+type+id)，search 却免鉴权 —— 于是忘了配密钥时
+故障表现极像「歌搜到了但放不出来」。本组用标准库独立复算签名来确认拼址正确。
 
 第 7、8 条针对的是「总是超时 + 最后发出来是个文件」这个症状：
 本地语音会被 AstrBot 转成 wav 再 base64 塞进**一条** WebSocket 帧，
@@ -183,6 +193,46 @@ def install_stubs() -> None:
     path_mod.get_astrbot_plugin_path = lambda: str(PLUGIN)  # type: ignore[attr-defined]
 
 
+class _ReplayDownloader:
+    """包一层真实 Downloader，把「已经成功下过的候选地址」复用起来。
+
+    ★ 为什么需要：
+    本自测会连续向同一个公共端点发十几次请求，对端短暂限速/抽风是常态。
+    第 7/8 组考的是**体积闸门与自动降档**（跟网络毫无关系），但
+    `_record_local()` 内部要重新下载一遍 —— 一次限速就会让这两组无辜判红，
+    看起来像代码坏了。这里把第 2 组已经下到的文件按候选地址缓存，
+    命中时**复制一份**返回（因为发送成功后 sender 会 cleanup 掉那个文件，
+    直接把缓存的路径交出去会被删掉），让这两组变成确定性用例。
+
+    第 2、5 组仍然用真实下载器 —— 下载本身的行为照样被覆盖。
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._cache: dict[str, Path] = {}
+        self._seq = 0
+
+    async def download_audio_multi(self, urls, *, headers=None, suffix=".mp3"):
+        for url in urls:
+            cached = self._cache.get(url)
+            if cached and cached.exists():
+                self._seq += 1
+                copy = cached.with_name(f"replay_{self._seq}_{cached.name}")
+                shutil.copy2(cached, copy)
+                return copy
+        path = await self._inner.download_audio_multi(
+            urls, headers=headers, suffix=suffix
+        )
+        if path:
+            for url in urls:
+                self._cache[url] = path
+        return path
+
+    def __getattr__(self, name):
+        # download_audio / download_image / cleanup 等一律转发给真实下载器
+        return getattr(self._inner, name)
+
+
 async def main() -> int:
     install_stubs()
     sys.path.insert(0, str(PLUGIN))
@@ -218,6 +268,8 @@ async def main() -> int:
         proxy=cfg.proxy, read_timeout=cfg.request_timeout, retries=cfg.request_retries
     )
     dl = Downloader(cfg, http)
+    # 带「下载结果复用」的包装器，专供与网络无关的用例使用（见类文档）。
+    dl_replay = _ReplayDownloader(dl)
 
     print("\n" + "=" * 62)
     print(f"注册的音源类 : {[c.__name__ for c in BaseMusicPlayer.get_all_subclass()]}")
@@ -265,16 +317,26 @@ async def main() -> int:
     # --- 2. 下载 + 魔数校验 ---
     # 后面的用例都依赖这一步的产物，所以先声明好、失败就整段跳过，
     # 不要拿 None 去做 Path(None) —— 那是脚本自己崩，不是被测代码有问题。
+    #
+    # ★ 这里加了有限重试（3 次）。本自测会连续向同一个公共端点发十几个请求，
+    #   对端短暂限速/抽风是常态；一次失败不代表代码有问题。连续 3 次都失败
+    #   才算真失败。注意用的是 download_audio_multi（顺带覆盖多端点回退）。
     path: Path | None = None
     if songs and songs[0].audio_url:
-        path = await dl.download_audio(
-            songs[0].audio_url, headers=player.audio_headers(songs[0])
-        )
+        for attempt in range(1, 4):
+            path = await dl_replay.download_audio_multi(
+                player.audio_url_candidates(songs[0]),
+                headers=player.audio_headers(songs[0]),
+            )
+            if path:
+                break
+            print(f"    · 第 {attempt}/3 次下载未成功，1.5s 后重试（公共端点偶发限速）")
+            await asyncio.sleep(1.5)
         if path:
             print(f"\n[2] 下载成功 {path.name}（{path.stat().st_size} 字节）")
             print(f"    ✓ 校验为有效音频：{is_valid_audio(path)}")
         else:
-            print("\n[2] ✗ 下载失败（音源端抽风？后续依赖下载的用例会跳过）")
+            print("\n[2] ✗ 连续 3 次下载都失败（端点可能真的挂了，后续依赖下载的用例会跳过）")
             ok = False
     elif songs:
         print("\n[2] ✗ 搜索结果的 audio_url 为空，跳过下载用例")
@@ -402,7 +464,7 @@ async def main() -> int:
         strict_raw["voice_format"] = "wav8k"  # 关掉自动降档，单测闸门本身
         strict_cfg = PluginConfig(strict_raw, None)
         ev = _FakeEvent()
-        reason = await MusicSender(strict_cfg, dl)._record_local(ev, player, songs[0])
+        reason = await MusicSender(strict_cfg, dl_replay)._record_local(ev, player, songs[0])
         print(f"    上限 1KB 时的返回：{(reason or 'None（竟然发出去了）')[:80]}")
         if reason and "超限" in reason and not any(
             getattr(c, "kw", {}).get("file") for c in ev.sent
@@ -424,7 +486,7 @@ async def main() -> int:
             downgrade_raw["voice_format"] = "auto"
             ev2 = _FakeEvent()
             reason2 = await MusicSender(
-                PluginConfig(downgrade_raw, None), dl
+                PluginConfig(downgrade_raw, None), dl_replay
             )._record_local(ev2, player, songs[0])
             print(f"\n[8] 16k 预计 {readable}，8k 预计 {r8}，上限设为 {limit} 字节")
             print(f"    返回值：{reason2 or 'None（发送成功）'}")
@@ -537,7 +599,81 @@ async def main() -> int:
             print("    ✗ 「音乐状态」没输出报告")
             ok = False
 
-    # --- 10. 去重闸门（治「同一首歌发两遍」）---
+    # --- 10. QQ 音乐音源 ---
+    # 背景：插件原先根本没有 QQ 音源，但 _conf_schema.json 的 default_player_name
+    # 却提供了「QQ点歌」选项 —— 选中后 get_player() 匹配不到任何音源返回 None，
+    # on_song 里又直接 `return`（静默放过），于是点歌一点反应都没有。
+    # 本组验证新增的 TencentMeting 确实被自动注册、且真的能走通搜索取链。
+    print("\n[10] QQ 音乐音源（TencentMeting）")
+    # ★ 必须从「main.py 用的那一份模块」里取类，不能用顶层 core.platform。
+    # 本自测把 main.py 按包名 astrbot_plugin_voice_music.main 加载，它里面的
+    # `from .core.platform import ...` 会生成一个**独立的模块对象**
+    # astrbot_plugin_voice_music.core.platform；而顶层 core.platform 是另一个副本。
+    # 两个副本各有各的 BaseMusicPlayer 与子类表，isinstance 跨副本必然为 False。
+    # 真实 AstrBot 里只会存在一份，所以这只是测试脚手架要照顾的细节。
+    platform_mod = sys.modules.get("astrbot_plugin_voice_music.core.platform")
+    TencentMeting = getattr(platform_mod, "TencentMeting", None) if platform_mod else None
+
+    qq_players: list = []
+    if TencentMeting is None:
+        print("    ✗ core/platform/__init__.py 没有导出 TencentMeting")
+        ok = False
+    else:
+        qq_players = [p for p in plugin.players if isinstance(p, TencentMeting)]
+        if not qq_players:
+            print("    ✗ TencentMeting 没被注册进 plugin.players（不会出现在任何点歌路径里）")
+            ok = False
+
+    if qq_players:
+        qq = qq_players[0]
+        print(f"    ✓ 已自动注册：{qq.platform.display_name}（关键词 {qq.platform.keywords}）")
+
+        qq_songs = await qq.fetch_songs("晴天", limit=3)
+        print(f"    搜索「晴天」返回 {len(qq_songs)} 首")
+        if not qq_songs:
+            print("    ✗ QQ 搜索无结果（端点可能临时抽风）")
+            ok = False
+        else:
+            s0 = qq_songs[0]
+            print(f"    第一首：{s0.display_name()}（id={s0.id}）")
+            # QQ 的 id 是字母数字 mid，如 0039MnYb0qxYhV；仍然藏在 url 里
+            if not s0.id:
+                print("    ✗ 没从 url 里解析出 QQ 歌曲 mid")
+                ok = False
+            else:
+                print("    ✓ 已解析出 QQ 歌曲 mid")
+            cands = qq.audio_url_candidates(s0)
+            print(f"    audio_url_candidates 生成 {len(cands)} 条候选")
+            for u in cands:
+                print(f"      - {u[:96]}")
+            if not cands:
+                print("    ✗ 没有候选直链")
+                ok = False
+
+            # 逐个试取直链。★ 公共端点下 QQ 的失败方式是「HTTP 200 + text/html + 空 body」
+            # 这种静默失败，热门版权歌（周杰伦等）基本都取不到。所以判定标准是
+            # 「前两首里至少有一首能拿到音频」，同时把失败的原样打出来作为可用度记录。
+            played = None
+            for cand in qq_songs[:2]:
+                got = await dl.download_audio_multi(
+                    qq.audio_url_candidates(cand), headers=qq.audio_headers(cand)
+                )
+                if got:
+                    played = cand
+                    print(
+                        f"    ✓ 可播放：{cand.display_name()}"
+                        f"（{got.stat().st_size} 字节）"
+                    )
+                    break
+                print(f"    · 取不到直链：{cand.display_name()}（多为版权热门歌）")
+
+            if played:
+                print("    ✓ QQ 音源可用（至少部分歌曲能取到真音频）")
+            else:
+                print("    ✗ 前两首都取不到直链，QQ 音源当前不可用")
+                ok = False
+
+    # --- 11. 去重闸门（治「同一首歌发两遍」）---
     # 症状：用户回了「1 语音」，插件发了一遍，隔了 20 多秒又发一遍，两条日志一模一样。
     # 根因：AstrBot 的 session_waiter 截获消息后会把它 **浅复制成新事件重新投递一遍**，
     #       那条消息同样会触发 LLM；LLM 看到「候选列表 + 1 语音」的上下文，
@@ -546,7 +682,7 @@ async def main() -> int:
     #           ② event.stop_event()（挡后续 listener）
     #           ③ 发送层的去重闸门（兜底，本组验证）
     # 注意：这里用独立的 sender 和独立会话标识，否则会被第 9 条留下的去重记录误伤。
-    print("\n[10] 去重闸门")
+    print("\n[11] 去重闸门")
     found = await player.fetch_songs("晴天", limit=1)
     if not found or not found[0].audio_url:
         print("    ✗ 没搜到可用歌曲，本组跳过（多半是音源端抽风，不是代码问题）")
@@ -606,6 +742,93 @@ async def main() -> int:
     else:
         print("    ✗ 去重关不掉")
         ok = False
+
+    # --- 12. 自建 Meting-API 的取链签名 ---
+    # 背景：公共端点拿不到 QQ 版权热门歌的直链（实测 200 + text/html + 0 字节）。
+    # 正路是自建 metowolf/Meting-API 并注入 QQ 音乐 Cookie，但该服务对
+    # url/pic/lrc 强制校验 auth=HMAC-SHA1(METING_TOKEN, server+type+id)，
+    # 而 search 免鉴权 —— 忘了配密钥就会表现成「搜得到歌、一取直链就 401」。
+    # 本组用标准库独立复算一遍签名，确认插件拼出的地址是对的。
+    print("\n[12] 自建 Meting-API 的取链签名（meting_token）")
+    import hashlib
+    import hmac
+
+    from core.model import Song
+
+    plat = sys.modules.get("astrbot_plugin_voice_music.core.platform")
+    QQ = getattr(plat, "TencentMeting", None)
+    NE = getattr(plat, "NeteaseMeting", None)
+    if QQ is None or NE is None:
+        print("    ✗ 取不到音源类，本组跳过")
+        ok = False
+    else:
+        SECRET = "token"
+        MID = "0039MnYb0qxYhV"
+        SELF_HOST = "https://my-meting.example.com/api"
+
+        s = Song(
+            id=MID, source="tencent", name="晴天", artists="周杰伦",
+            audio_url=None, cover_url=None, lyrics=None, note="QQ点歌",
+        )
+
+        # 12a. 带密钥：必须生成与官方公式一致的 auth
+        auth_raw = dict(raw)
+        auth_raw["meting_token"] = SECRET
+        auth_raw["source_endpoints"] = [SELF_HOST]
+        qq_auth = QQ(PluginConfig(auth_raw, None), http)
+        urls = qq_auth.audio_url_candidates(s)
+        expect = hmac.new(
+            SECRET.encode(), f"tencenturl{MID}".encode(), hashlib.sha1
+        ).hexdigest()
+        print(f"    独立复算 auth = {expect}")
+        print(f"    插件生成候选 = {urls[0] if urls else '(空)'}")
+        if len(urls) == 1 and f"auth={expect}" in urls[0]:
+            print("    ✓ 签名与官方公式一致，取链地址带上了 auth")
+        else:
+            print("    ✗ 签名不对或没拼上 auth（自建端点会 401）")
+            ok = False
+
+        # 12b. base 自带查询串时必须用 & 续接，不能拼出两个 ?
+        joined = QQ._join("https://x/api?prefix=1", {"a": "b"})
+        if joined == "https://x/api?prefix=1&a=b":
+            print("    ✓ 端点自带查询串时用 & 续接（不会拼出 ...?prefix=1?server=...）")
+        else:
+            print(f"    ✗ 拼址错误：{joined}")
+            ok = False
+
+        # 12c. 不填密钥（公共端点）：不得出现 auth，否则会平白多一次 401 重试
+        no_auth_raw = dict(raw)
+        no_auth_raw["meting_token"] = ""
+        no_auth_raw["source_endpoints"] = [SELF_HOST]
+        qq_no = QQ(PluginConfig(no_auth_raw, None), http)
+        urls_no = qq_no.audio_url_candidates(s)
+        if urls_no and all("auth=" not in u for u in urls_no):
+            print("    ✓ 未配置密钥时不加 auth（公共端点不受影响）")
+        else:
+            print(f"    ✗ 未配置密钥却加了 auth：{urls_no}")
+            ok = False
+
+        # 12d. server 名参与签名，换平台不能沿用同一串
+        ne_auth_raw = dict(raw)
+        ne_auth_raw["meting_token"] = SECRET
+        ne_auth_raw["source_endpoints"] = [SELF_HOST]
+        ne = NE(PluginConfig(ne_auth_raw, None), http)
+        ne_song = Song(
+            id="2652820720", source="netease", name="晴天", artists="x",
+            audio_url=None, cover_url=None, lyrics=None, note="网易点歌",
+        )
+        ne_url = ne.audio_url_candidates(ne_song)[0]
+        ne_expect = hmac.new(
+            SECRET.encode(), "neteaseurl2652820720".encode(), hashlib.sha1
+        ).hexdigest()
+        if (
+            f"auth={ne_expect}" in ne_url
+            and qq_auth._auth("url", MID) != ne._auth("url", MID)
+        ):
+            print("    ✓ 签名里的 server 段生效（腾讯/网易不会算出同一个值）")
+        else:
+            print("    ✗ server 没参与签名")
+            ok = False
 
     await plugin.terminate()
 

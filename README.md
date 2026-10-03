@@ -245,7 +245,7 @@ docker logs <容器名> 2>&1 | grep voice_music | tail -20
 |---|---|
 | `点歌 晴天` | 用默认平台搜索，回复序号选歌 |
 | `点歌 晴天 1` | 直接选中第 1 首 |
-| `网易点歌 晴天` / `网易web 晴天` | 指定音源 |
+| `网易点歌 晴天` / `网易web 晴天` / `QQ点歌 晴天` | 指定音源 |
 | `2` / `2 语音` / `2 文件` | 回复序号，可指定发送方式 |
 | `音乐状态` | 输出自检报告（ffmpeg / 端点连通性 / 缓存目录 / 发送策略） |
 
@@ -267,7 +267,9 @@ docker logs <容器名> 2>&1 | grep voice_music | tail -20
 
 | 配置项 | 默认 | 作用 |
 |---|---|---|
+| `default_player_name` | `网易点歌` | 「点歌 歌名」用哪个平台。可选 `网易点歌` / `QQ点歌`；也可在命令里直接指定（见上表） |
 | `source_endpoints` | 两个实测可用端点 | **多端点回退列表**，建议自行部署 Meting 后替换 |
+| `meting_token` | 空 | 只在把 `source_endpoints` 指向**自建** [Meting-API](https://github.com/metowolf/Meting-API) 时才填，须与它的 `METING_TOKEN` 一致。不填会出现「搜得到歌、一取直链就 401」（见第三节 6） |
 | `request_timeout` | 8 | 单次请求超时（秒） |
 | `request_retries` | 2 | 单端点重试次数 |
 | `song_limit` | 5 | 搜索返回的候选数量 |
@@ -323,7 +325,25 @@ A：多半是音源接口挂住（aiohttp 默认总超时 300 秒）。本插件
 **Q：`点歌超时！`？**
 A：这是另一回事 —— 发出候选后 60 秒内没回序号就会取消。调 `selection_timeout` 即可。
 
+**Q：选 `QQ点歌` 提示「无可用音源」/ 点了完全没反应？**
+A：旧版本的 `_conf_schema.json` 允许把默认平台选成「QQ点歌」，但仓库里**并没有 QQ 音源**，
+`get_player()` 匹配不到就返回 `None`，LLM 工具路径会直接回一句「无可用音源」。
+现已内置 `TencentMeting`，升级后即可用。
+
+**Q：QQ 音乐搜得到，但一放就失败？**
+A：版权热门歌（周杰伦等）在公共端点上拿不到直链 —— 上游不给 `vkey`，Meting 返回一个
+**0 字节的 HTML 页，而状态码是 200**。非版权歌正常。要放版权歌请自建 Meting-API
+并注入 QQ 登录 Cookie，见[第三节 6](#6-让-qq-音乐真正能放自建-meting-api)。
+
+**Q：自建了 Meting-API，搜索正常但取直链报 401？**
+A：`meting_token` 没填或和服务的 `METING_TOKEN` 不一致。Meting-API 对
+`url`/`pic`/`lrc` 强制校验 `auth=HMAC-SHA1(密钥, server+type+id)`，而 `search` 免鉴权，
+所以只会在取链这一步炸。填上密钥即可，插件会自动算签名。
+
 ### 5. 加一个新音源（不用改主流程）
+
+`core/platform/meting.py` 里的 `TencentMeting`（QQ 音乐）就是照这个方式加的，
+可以直接拿它当范例：
 
 ```python
 # core/platform/meting.py
@@ -339,6 +359,74 @@ class KugouMeting(MetingPlayer):
 
 如果需要完全自建搜索（不走 Meting），参考 `NeteaseWeb`：覆盖 `fetch_songs()`，
 直链用 `audio_url_candidates()` 补全。
+
+> ⚠️ **写 `keywords` 时别用太短的词。** `get_player()` 对命令词做的是**子串匹配**，
+> 而 `on_song` 只要消息以 @机器人 / 唤醒词开头就会接管。早期 `TencentMeting`
+> 用过裸 `"qq"`，结果群里一句「@bot qq群 123」也会被命中、插件跑去搜「群 123」。
+> 现在改成了 `["QQ点歌", "QQ音乐", "tencent"]`。
+
+### 6. 让 QQ 音乐真正能放：自建 Meting-API
+
+**先说结论：公共端点上的 QQ 音乐只有「非版权歌」能放，版权热门歌永远拿不到。**
+这个不是本插件的 bug，也不是配置问题，实测数据如下（2026-10）：
+
+| 探测目标 | 周杰伦《晴天》（版权热门） | 非版权翻唱 |
+|---|---|---|
+| `api.qijieya.cn` 取直链 | ❌ `HTTP 200` + `Content-Type: text/html` + **0 字节** | ✅ `audio/mpeg`，4.46 MB |
+| `api.i-meto.com` 取直链 | ❌ `404`（带它自己发的 `auth`） | ❌ `404` |
+| 两个端点的 `search` | ✅ 都能返回 30 条，ID 是 QQ 的字母数字 mid（如 `0039MnYb0qxYhV`） | ✅ |
+
+为什么是**静默失败**：QQ 音乐对版权歌不签发 `vkey`，Meting 上游拿不到就回一个空的
+HTML 页 —— 状态码是 200，看着完全正常，只能靠下载层的魔数校验识别出来。
+
+**要拿到版权歌的直链，必须带上 QQ 音乐的登录态（Cookie）。** 公共端点不会替你带，
+所以正路是自建一个：
+
+```bash
+# 1. 起一个自己的 Meting-API（官方镜像）
+docker run -d --name meting-api -p 8080:80 \
+  -e METING_TOKEN=你的密钥 \
+  -e METING_COOKIE_TENCENT="从 y.qq.com 登录后 F12 复制的完整 cookie" \
+  ghcr.io/metowolf/meting-api:latest
+
+# 2. 验证搜索（免鉴权，应返回 JSON 数组）
+curl "http://127.0.0.1:8080/api?server=tencent&type=search&id=晴天"
+
+# 3. 验证取直链（敏感接口，须带 auth=HMAC-SHA1(你的密钥, server+type+id)）
+#    这一步能不能出 302，就是「QQ 版权歌到底能不能放」的判据
+```
+
+然后在 AstrBot 的插件配置里：
+
+```
+source_endpoints = ["http://<你的服务器IP>:8080/api"]
+meting_token     = 你的密钥          # 必须与上面 METING_TOKEN 一致
+default_player_name = QQ点歌         # 可选
+```
+
+**为什么一定要填 `meting_token`**：Meting-API 把 `url` / `pic` / `lrc` 列为敏感接口，
+强制校验 `auth`，而 `search` 是免鉴权的。只改 `source_endpoints` 不填密钥，
+故障会表现成**「歌搜得到，一取直链就 401」**——看起来像「音源坏了」。
+插件会在配置了该项时自动为每首歌算好签名（见 `meting.py` 的 `_auth()`）。
+
+**两个容易忽略的前提：**
+
+- **Cookie 需要会员账号。** 账号没有对应权益时，热门歌照样不给 `vkey`
+  （上游返回的错误是「全部 quality 都被拒」，本质是账号没权限，不是密钥错）。
+  Cookie 会过期，`meting-api` 的 Cookie 缓存 5 分钟，用文件方式挂载时改完即生效。
+- **QQ 音乐有地区限制，出口 IP 必须在国内。** 服务器在境外时，QQ 音源基本取不到直链
+  （网易云不受影响）。这也是为什么放在境内云服务器上的 AstrBot 反而更合适。
+
+**不想折腾的替代方案**（按推荐度）：
+
+1. **就用网易云。** 本插件默认音源实测可用，绝大多数歌曲都有；QQ 音源的价值主要在
+   「只有 QQ 才有的独家/翻唱」和搜得准。
+2. **用第三方 QQ 音乐 API 项目**：`jsososo/QQMusicApi`、`Rain120/qq-music-api`、
+   `CZ-Gen/QQMusicApi` 这类项目可以直接拿 `vkey` 拼直链（`M500`/`M800`/`F000` 等档位），
+   但它们同样**需要你提供登录 Cookie**，且返回结构不是 Meting 格式 —— 要用的话得
+   自己写一个 `BaseMusicPlayer` 子类来对接（照 `NeteaseWeb` 的写法）。
+3. **公有云函数 / Koyeb 一键部署 Meting-API**：Meting-API 官方 README 有一键部署按钮，
+   但**免费区域多在境外**，会撞上上面那条地区限制，QQ 音源大概率不可用。
 
 ---
 
@@ -358,7 +446,7 @@ class KugouMeting(MetingPlayer):
 
 ### 2. 「发的是文件不是语音」
 
-`send_modes` 默认 `ark_card → record_local → record_link → file_local → …`，
+`send_modes` 默认 `record_link → record_local → file_local → text`，
 **前面失败就往后降级**，而 file 模式不校验内容，所以最后往往「成功」发出去一个文件。
 
 **语音链路里 ffmpeg 是必经环节**，这点我核对了 AstrBot 源码：
@@ -590,11 +678,17 @@ python .selftest/run_selftest.py
 - **体积闸门**：上限设成 1KB 时被拦下，返回「语音体积超限：预计 5.7 MB > 上限 1.0 KB…」，且**确实没有发出任何组件**
 - **自动降档**：16k 预计 11.4 MB、8k 预计 5.7 MB，上限卡在中间时自动降到 wav8k 并成功发出
 - **`main.py` 能被加载**：相对导入正常、命令 / 事件监听 / LLM 工具三类钩子全部注册，
-  音源自动发现到 2 个，并且 `点歌 晴天 1` 与 `音乐状态` 两条命令都真跑了一遍
+  音源自动发现到 3 个（网易点歌 / 网易web / QQ点歌），
+  并且 `点歌 晴天 1` 与 `音乐状态` 两条命令都真跑了一遍
+- **QQ 音源可用**：`TencentMeting` 被自动注册；搜索返回真 QQ 数据、ID 从 url 里解析出
+  字母数字 mid；非版权歌能真的下到音频（版权热门歌取不到，原因见第三节 6）
 - **LLM 链路已被掐掉**：`点歌` 与选歌回复都会调 `should_call_llm(False)`，
   这是防「同一首歌发两遍」最关键的一层（第 9 组断言 `call_llm is False`）
 - **去重闸门**：同一会话内同一首歌连发两次，第一次发出 1 条、第二次 0 条；
   换个会话点同一首则照常发出 1 条（不误伤别的群）；`dedup_seconds = 0` 时去重完全关闭
+- **自建端点签名**：`meting_token` 生成的 `auth` 与
+  `HMAC-SHA1(token, server+type+id)` 独立复算结果一致；未配置密钥时不加 `auth`；
+  端点自带查询串时用 `&` 续接（不会拼出两个 `?`）
 
 > 第 9 组是专门为「部署到服务器」加的：前 8 组只覆盖 `core/`，
 > 入口文件如果装饰器签名或相对导入有问题，你在服务器上只会看到一句泛泛的加载失败。
@@ -612,9 +706,9 @@ python .selftest/run_selftest.py
 
 ## 五、注意事项
 
-- 公开音源端点随时可能失效或限速，**长期稳定请自建 [Meting-API](https://github.com/metowolf/Meting)** 并填入 `source_endpoints`。
-- 本骨架默认只带网易云两个音源（实测可用）。QQ 音乐/酷狗在公开端点上普遍返回空结果或失效直链，需要自建服务。
+- 公开音源端点随时可能失效或限速，**长期稳定请自建 [Meting-API](https://github.com/metowolf/Meting-API)** 并填入 `source_endpoints` + `meting_token`（见第三节 6）。
+- 本插件默认带三个音源：网易点歌、网易web（实测可用）、QQ点歌。**QQ 音源在公共端点上的搜索没问题，但版权热门歌拿不到直链**（上游不给 `vkey`，Meting 返回空 HTML，状态码却是 200）。要放版权歌必须自建 Meting-API 并注入 QQ 登录 Cookie，且出口 IP 需在国内 —— 详见第三节 6。
 - 语音能否送达最终取决于协议端（NapCat / Lagrange）。若某平台适配器不支持语音组件，把平台名填入 `record_unsupported`。
 - 临时音频文件延迟 60 秒清理（`sender.py` 的 `_defer_cleanup`），避免适配器异步读取的竞态。
 - **境外服务器**：国内音源接口可能不稳定，建议把 `request_timeout` 调大一点、多配几个 `source_endpoints`，
-  必要时用 `proxy` 走宿主机代理。
+  必要时用 `proxy` 走宿主机代理。QQ 音源在境外取直链基本不可用。

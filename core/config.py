@@ -63,6 +63,27 @@ class PluginConfig:
         return [u for u in urls if u.startswith(("http://", "https://"))]
 
     @property
+    def meting_token(self) -> str:
+        """自建 Meting-API 的 HMAC 签名密钥（对应它的 METING_TOKEN 环境变量）。
+
+        ★ 为什么需要这一项：
+        metowolf/Meting-API（v1.11+）把 `url` / `pic` / `lrc` 列为**敏感接口**，
+        强制校验 `auth` 参数：
+
+            auth = HMAC-SHA1(METING_TOKEN, server + type + id)
+
+        而 `search` 是**免鉴权**的。所以如果只把 source_endpoints 指向自建实例
+        而不提供密钥，会出现最难排查的那种失败：**搜索正常返回候选、取直链却 401**
+        —— 看起来像「歌搜到了但放不出来」。填上这个密钥后，插件会自动为每首歌
+        算好 auth 拼进取链地址。
+
+        留空表示端点不需要鉴权（公共端点如 api.qijieya.cn 就是这样）。
+        注意：第三方托管的实例（如 api.i-meto.com）用的是**它自己的私有密钥**，
+        你算不出来，只能直接使用它 search 响应里返回的完整 url —— 那种情况下本项留空。
+        """
+        return str(self.raw.get("meting_token") or "").strip()
+
+    @property
     def request_timeout(self) -> float:
         return float(self.raw.get("request_timeout") or 8)
 

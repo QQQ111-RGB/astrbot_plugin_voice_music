@@ -1,7 +1,7 @@
 {
     "default_player_name": {
         "description": "默认点歌平台",
-        "hint": "「点歌 歌名」时默认使用的平台。也可用平台命令直接指定：网易点歌 / QQ点歌",
+        "hint": "「点歌 歌名」时默认使用的平台。也可用平台命令直接指定：网易点歌 / 网易web / QQ点歌",
         "type": "string",
         "options": [
             "网易点歌",
@@ -17,6 +17,12 @@
             "https://api.qijieya.cn/meting/",
             "https://api.i-meto.com/meting/api"
         ]
+    },
+    "meting_token": {
+        "description": "自建 Meting-API 的签名密钥（METING_TOKEN）",
+        "hint": "只在把 source_endpoints 指向【自建】Meting-API 时才需要填，须与它的 METING_TOKEN 一致。该服务对取直链接口强制校验 auth=HMAC-SHA1(密钥, server+type+id)，不填会「搜得到歌、取不到直链（401）」。公共端点（api.qijieya.cn）以及第三方托管实例（api.i-meto.com，用其私有密钥）都留空",
+        "type": "string",
+        "default": ""
     },
     "request_timeout": {
         "description": "单次请求超时（秒）",
@@ -114,17 +120,6 @@
         "hint": "★本地语音会被 AstrBot 转成 wav 再 base64 塞进一条 WebSocket 帧。超过协议端 maxPayload 时连接会被断开，AstrBot 报超时、插件降级发文件。默认 8 MiB；超限时会先自动降到 wav8k 重试一次，仍超则拒绝发送并说明原因。填 0 表示不限制",
         "type": "int",
         "default": 8388608
-    },
-    "dedup_seconds": {
-        "description": "同一首歌去重窗口（秒）",
-        "hint": "★解决「同一首歌发两遍」。AstrBot 的选歌等待器截获你的消息后会把它重新投递一遍、再触发一次 LLM，LLM 可能顺手又点一次歌。此窗口内同一会话里的同一首歌只会发一次。0 = 关闭去重",
-        "type": "int",
-        "slider": {
-            "min": 0,
-            "max": 120,
-            "step": 5
-        },
-        "default": 20
     },
     "dedup_seconds": {
         "description": "同一首歌的去重窗口（秒）",

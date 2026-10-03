@@ -166,6 +166,16 @@ async def build_report(
         for base, ok, cost, note in results:
             mark = "✓" if ok else "✗"
             lines.append(f"  {mark} [{cost:.1f}s] {base} —— {note}")
+        # ★这里探的是 search，而 search 在自建 Meting-API 上是**免鉴权**的。
+        #   所以「端点全部 ✓」并不代表取直链也没问题 —— 敏感接口还要过 auth 校验。
+        #   不把这条写出来，用户会以为端点全绿就等于能放歌。
+        if cfg.meting_token:
+            lines.append("  （已配置 meting_token：取直链会自动附 auth=HMAC-SHA1 签名）")
+        else:
+            lines.append(
+                "  （未配置 meting_token：仅适合免鉴权的公共端点；"
+                "若 source_endpoints 是自建 Meting-API，取直链会 401）"
+            )
 
     lines.append("")
     lines.append("· 结论")

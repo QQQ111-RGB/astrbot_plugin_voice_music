@@ -38,7 +38,18 @@ from .core.sender import MusicSender
 from .core.utils import parse_index_and_modes
 
 # 命令别名（装饰器在类定义时求值，所以写死；改这里即可增删）
-COMMAND_ALIAS = {"网易点歌", "网易云", "网易web", "网易官方"}
+# ★ 这里必须和 core/platform/ 里各音源的 keywords 对齐，否则那个平台词不会被
+#   识别成唤醒命令，「QQ点歌 晴天」这种不带 @ 的写法会直接进不来。
+COMMAND_ALIAS = {
+    # 网易系
+    "网易点歌",
+    "网易云",
+    "网易web",
+    "网易官方",
+    # QQ 系
+    "QQ点歌",
+    "QQ音乐",
+}
 STATUS_ALIAS = {"点歌诊断", "音乐诊断", "音乐状态"}
 
 
@@ -282,7 +293,7 @@ class VoiceMusicPlugin(Star):
 
         Args:
             song_name(string): 歌曲名称或包含歌手的关键词
-            platform(string): 可选。指定音源平台，严格匹配：网易点歌 / 网易web。留空用默认平台
+            platform(string): 可选。指定音源平台，严格匹配：网易点歌 / 网易web / QQ点歌。留空用默认平台
         """
         player = (
             self.get_player(name=platform) if platform else self.get_player(default=True)

@@ -8,11 +8,12 @@
 """
 
 from .base import BaseMusicPlayer
-from .meting import MetingPlayer, NeteaseMeting, NeteaseWeb
+from .meting import MetingPlayer, NeteaseMeting, NeteaseWeb, TencentMeting
 
 __all__ = [
     "BaseMusicPlayer",
     "MetingPlayer",
     "NeteaseMeting",
     "NeteaseWeb",
+    "TencentMeting",
 ]
