@@ -322,12 +322,39 @@ git clone <本仓库地址> astrbot_plugin_voice_music
 
 **方式 2：下载 ZIP**，解压后把整个目录放到 `AstrBot/data/plugins/astrbot_plugin_voice_music/`。
 
-之后：
+**方式 3：直接从本机传上去**（Docker + 云服务器，没走 GitHub 时用这个）
 
-1. AstrBot 会自动安装插件依赖（装到 `data/site-packages`）。若没自动装，可在 WebUI 插件页手动触发，
-   或 `docker exec -it <容器名> pip install -r /AstrBot/data/plugins/astrbot_plugin_voice_music/requirements.txt`。
-2. 按第二节确认 ffmpeg。
-3. 重启 AstrBot，在群里发 **`音乐状态`** 看自检报告。
+```bash
+# ① 本机打包（在仓库的上一级目录执行）
+tar --exclude='.git' -czf astrbot_plugin_voice_music.tar.gz astrbot_plugin_voice_music
+
+# ② 传到服务器
+scp astrbot_plugin_voice_music.tar.gz <用户>@<服务器IP>:~/
+
+# ③ 服务器上解到 AstrBot 的数据卷里（路径按你的实际情况改）
+cd /path/to/astrbot/data/plugins
+tar -xzf ~/astrbot_plugin_voice_music.tar.gz
+ls astrbot_plugin_voice_music/main.py     # 确认解出来了
+```
+
+**★ GitHub 不是运行条件，只是分发渠道。** 只要这个目录出现在 `data/plugins/` 下就能用。
+反过来，如果你想以后在服务器上 `git pull` 更新，那就得先推到 GitHub（私有仓库也行）再 `git clone`。
+
+### 装完怎么确认成功了
+
+```bash
+# 1) 文件到位了吗
+docker exec -it <容器名> ls /AstrBot/data/plugins/astrbot_plugin_voice_music/main.py
+
+# 2) 依赖装了吗（AstrBot 通常会自动装到 data/site-packages）
+docker exec -it <容器名> python -c "import aiohttp, aiofiles; print('deps ok')"
+
+# 3) 重启后看加载日志
+docker logs <容器名> 2>&1 | grep voice_music | tail -20
+#   应该能看到「已加载音源：[...]」和「ffmpeg 就绪：...」
+```
+
+最后在群里发 **`音乐状态`**，能收到自检报告就说明整条链路通了。
 
 ## 五、命令
 
@@ -399,6 +426,11 @@ python .selftest/run_selftest.py
 - `音乐状态` 自检报告生成正常
 - **体积闸门**：上限设成 1KB 时被拦下，返回「语音体积超限：预计 5.7 MB > 上限 1.0 KB…」，且**确实没有发出任何组件**
 - **自动降档**：16k 预计 11.4 MB、8k 预计 5.7 MB，上限卡在中间时自动降到 wav8k 并成功发出
+- **`main.py` 能被加载**：相对导入正常、命令 / 事件监听 / LLM 工具三类钩子全部注册，
+  音源自动发现到 2 个，并且 `点歌 晴天 1` 与 `音乐状态` 两条命令都真跑了一遍
+
+> 第 9 条是专门为「部署到服务器」加的：前 8 条只覆盖 `core/`，
+> 入口文件如果装饰器签名或相对导入有问题，你在服务器上只会看到一句泛泛的加载失败。
 
 真实跑出来的数字（`晴天` 那首 11.2 MB 的 mp3）：
 

@@ -9,6 +9,10 @@
   6. 自检报告
   7. 体积闸门：超限时必须拒绝发送并说明原因（而不是发出去撞协议端上限）
   8. 自动降档：16k wav 超限时自动降到 8k 重转后仍能发出
+  9. 加载 main.py：装饰器注册齐全、音源发现正常、「点歌」「音乐状态」两条命令真跑通
+
+第 9 条单独存在的理由：前 8 条只覆盖 core/，main.py 一行都没被执行过。如果入口的
+装饰器签名或相对导入有问题，部署到服务器上只会看到一句泛泛的加载失败，很难定位。
 
 第 7、8 条针对的是「总是超时 + 最后发出来是个文件」这个症状：
 本地语音会被 AstrBot 转成 wav 再 base64 塞进**一条** WebSocket 帧，
@@ -30,6 +34,9 @@ PLUGIN = Path(__file__).resolve().parents[1]
 
 # 测试产生的音频写进系统临时目录，不污染仓库。
 TEST_TMP = Path(tempfile.gettempdir()) / "wb_voice_music_selftest"
+
+# 装饰器注册项，供「插件能否被 AstrBot 加载」那一步断言
+REGISTERED: list[tuple[str, str]] = []
 
 
 def _pkg(name: str) -> types.ModuleType:
@@ -55,8 +62,34 @@ def install_stubs() -> None:
         """占位：本测试不涉及事件流。"""
 
     class _Filter:
+        """复刻 AstrBot 的三个装饰器：注册时不能报错，且要把注册项记下来。"""
+
         class EventMessageType:
             ALL = "all"
+
+        @staticmethod
+        def command(name, alias=None):
+            def deco(fn):
+                REGISTERED.append(("command", f"{name}|{sorted(alias or [])}"))
+                return fn
+
+            return deco
+
+        @staticmethod
+        def event_message_type(_type):
+            def deco(fn):
+                REGISTERED.append(("event_message_type", fn.__name__))
+                return fn
+
+            return deco
+
+        @staticmethod
+        def llm_tool():
+            def deco(fn):
+                REGISTERED.append(("llm_tool", fn.__name__))
+                return fn
+
+            return deco
 
     event_mod.AstrMessageEvent = AstrMessageEvent  # type: ignore[attr-defined]
     event_mod.filter = _Filter()  # type: ignore[attr-defined]
@@ -114,14 +147,28 @@ def install_stubs() -> None:
 
     utils_pkg = _pkg("astrbot.core.utils")
     sw_mod = _pkg("astrbot.core.utils.session_waiter")
-    sw_mod.SessionController = object  # type: ignore[attr-defined]
 
-    def session_waiter(**kw):
+    class SessionController:
+        """最小控制器：只记录 stop() 是否被调用。"""
+
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    def session_waiter(timeout=0, **kw):
+        """把 fn(controller, event) 包成 fn(event)，模拟 AstrBot 的注入方式。"""
+
         def deco(fn):
-            return fn
+            async def wrapper(event, *args, **kwargs):
+                return await fn(SessionController(), event, *args, **kwargs)
+
+            return wrapper
 
         return deco
 
+    sw_mod.SessionController = SessionController  # type: ignore[attr-defined]
     sw_mod.session_waiter = session_waiter  # type: ignore[attr-defined]
     utils_pkg.session_waiter = sw_mod  # type: ignore[attr-defined]
 
@@ -353,6 +400,99 @@ async def main() -> int:
             else:
                 print("    ✗ 自动降档未生效")
                 ok = False
+
+    # --- 9. 插件能否被 AstrBot 加载 + 真跑一遍命令入口 ---
+    # 这一步单独存在的理由：前面 1~8 只测 core/，main.py 一行都没被执行过。
+    # 如果 main.py 的装饰器签名或相对导入有问题，你在服务器上只会看到一句
+    # 泛泛的加载失败，很难定位。这里把它完整跑一遍。
+    print("\n[9] 加载 main.py 并跑一遍命令入口")
+    import importlib.util
+
+    pkg = types.ModuleType("astrbot_plugin_voice_music")
+    pkg.__path__ = [str(PLUGIN)]  # type: ignore[attr-defined]
+    sys.modules["astrbot_plugin_voice_music"] = pkg
+
+    main_spec = importlib.util.spec_from_file_location(
+        "astrbot_plugin_voice_music.main", PLUGIN / "main.py"
+    )
+    assert main_spec and main_spec.loader
+    main_mod = importlib.util.module_from_spec(main_spec)
+    sys.modules[main_spec.name] = main_mod
+    main_spec.loader.exec_module(main_mod)
+    print("    ✓ main.py 导入成功（相对导入与 API 引用都没问题）")
+
+    print(f"    注册的装饰器：{REGISTERED}")
+    kinds = {k for k, _ in REGISTERED}
+    if kinds == {"command", "event_message_type", "llm_tool"}:
+        print("    ✓ 命令 / 事件监听 / LLM 工具三类钩子都注册上了")
+    else:
+        print("    ✗ 钩子注册不全，AstrBot 里会收不到消息")
+        ok = False
+
+    class _FakeMsgEvent:
+        """够 on_song 用即可。"""
+
+        def __init__(self, text: str):
+            self.message_str = text
+            self.is_at_or_wake_command = True
+            self.sent: list = []
+            self.stopped = False
+
+        def get_platform_name(self):
+            return "aiocqhttp"
+
+        def get_sender_name(self):
+            return "tester"
+
+        def plain_result(self, text):
+            return ("plain", text)
+
+        def chain_result(self, comps):
+            return ("chain", comps)
+
+        async def send(self, payload):
+            self.sent.append(payload)
+
+        def stop_event(self):
+            self.stopped = True
+
+    plugin = main_mod.VoiceMusicPlugin(object(), dict(raw))
+    await plugin.initialize()
+    print(f"    加载后的音源：{[p.platform.display_name for p in plugin.players]}")
+    if plugin.players and plugin.keywords:
+        print(f"    命令关键词：{sorted(set(plugin.keywords))}")
+    else:
+        print("    ✗ 没有音源被注册，点歌一定失败")
+        ok = False
+
+    ev9 = _FakeMsgEvent("点歌 晴天 1")
+    try:
+        async for _chunk in plugin.on_song(ev9):
+            pass
+    except Exception as e:  # noqa: BLE001
+        print(f"    ✗ on_song 抛异常：{type(e).__name__}: {e}")
+        ok = False
+    else:
+        if ev9.sent and ev9.stopped:
+            print(f"    ✓ 「点歌 晴天 1」跑通，发出 {len(ev9.sent)} 条消息并 stop_event")
+        else:
+            print(f"    ✗ 命令没走通（sent={len(ev9.sent)}, stopped={ev9.stopped}）")
+            ok = False
+
+    ev9b = _FakeMsgEvent("音乐状态")
+    try:
+        chunks = [c async for c in plugin.cmd_status(ev9b)]
+    except Exception as e:  # noqa: BLE001
+        print(f"    ✗ cmd_status 抛异常：{type(e).__name__}: {e}")
+        ok = False
+    else:
+        if chunks and "自检报告" in str(chunks[0]):
+            print("    ✓ 「音乐状态」命令输出正常")
+        else:
+            print("    ✗ 「音乐状态」没输出报告")
+            ok = False
+
+    await plugin.terminate()
 
     await http.close()
     print("\n" + "=" * 62)
