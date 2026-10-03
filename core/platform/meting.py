@@ -13,6 +13,7 @@ Meting 是一套「一个接口打通多站点」的规范，调用形如：
 
 from __future__ import annotations
 
+import re
 from typing import ClassVar
 
 from astrbot.api import logger
@@ -24,6 +25,16 @@ from .base import BaseMusicPlayer
 
 # 网易官方 web 搜索接口（无需鉴权）
 _NETEASE_WEB_SEARCH = "http://music.163.com/api/search/get/web"
+
+# ★ 从取链 URL 里把歌曲 ID 抠出来。
+#
+# 为什么需要：实测（2026-10）两个公共 Meting 端点的 search 响应
+# **根本不含 id 字段**，只有 [name/artist/url/pic/lrc]：
+#     {"name": "...", "url": "https://api.qijieya.cn/meting/?server=netease&type=url&id=2652820720"}
+# 歌曲 ID 是被塞在 url 里的。不去抠它的话 Song.id 恒为空串，后果是
+# `audio_url_candidates()` 里 `if song.id:` 那个守卫永远不成立 ——
+# **多端点回退会静默失效，只剩一条候选地址**，第一个端点抽风就整体失败。
+_ID_IN_URL = re.compile(r"[?&]id=([^&\s]+)")
 
 
 class MetingPlayer(BaseMusicPlayer):
@@ -49,13 +60,24 @@ class MetingPlayer(BaseMusicPlayer):
 
     @staticmethod
     def _parse_item(item: dict, source: str, note: str) -> Song:
-        """兼容两种字段命名：name/artist 与 title/author。"""
+        """兼容两种字段命名：name/artist 与 title/author。
+
+        id 按三级兜底取值：直接给的 id -> url_id -> 从 url 里抠。
+        最后那一级是本插件实测补上的，缺了它多端点回退会失效。
+        """
+        url = item.get("url")
+        song_id = item.get("id") or item.get("url_id")
+        if not song_id and url:
+            matched = _ID_IN_URL.search(str(url))
+            if matched:
+                song_id = matched.group(1)
+
         return Song(
-            id=str(item.get("id") or item.get("url_id") or ""),
+            id=str(song_id or ""),
             source=source,
             name=item.get("name") or item.get("title"),
             artists=item.get("artist") or item.get("author"),
-            audio_url=item.get("url"),
+            audio_url=url,
             cover_url=item.get("pic"),
             lyrics=item.get("lrc"),
             note=note,

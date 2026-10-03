@@ -242,6 +242,26 @@ async def main() -> int:
     else:
         print("    ✓ 回退生效，未长时间挂起")
 
+    # Meting 的 search 响应不含 id 字段（ID 藏在 url 里），必须抠出来。
+    # 抠不出来的话 Song.id 恒为空 -> audio_url_candidates() 里的 `if song.id:`
+    # 不成立 -> 多端点回退静默失效，只剩一条候选地址。
+    if songs:
+        no_id = [s.display_name() for s in songs if not s.id]
+        if no_id:
+            print(f"    ✗ 这些歌没解析出 id：{no_id}（多端点回退会失效！）")
+            ok = False
+        else:
+            print(f"    ✓ 所有歌都解析出了 id（如 {songs[0].id}）")
+        cands0 = player.audio_url_candidates(songs[0])
+        print(f"    audio_url_candidates 生成 {len(cands0)} 条候选")
+        for u in cands0:
+            print(f"      - {u[:96]}")
+        if len(cands0) >= 2:
+            print("    ✓ 多端点候选回退可用（单端点抽风时能自动换）")
+        else:
+            print("    ✗ 只有一条候选，端点一挂就整体失败")
+            ok = False
+
     # --- 2. 下载 + 魔数校验 ---
     # 后面的用例都依赖这一步的产物，所以先声明好、失败就整段跳过，
     # 不要拿 None 去做 Path(None) —— 那是脚本自己崩，不是被测代码有问题。

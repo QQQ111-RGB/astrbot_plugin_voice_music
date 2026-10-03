@@ -39,6 +39,7 @@ AstrBot 侧表现为「超时」，然后插件降级去发文件，你就收到
 | 总是显示超时 | ① `aiohttp.ClientSession()` 默认总超时 **300 秒**，接口挂住就一直等；② 公共音源域名时好时坏，单点无备用；③ **语音那一条 WebSocket 帧太大，协议端直接断连**，AstrBot 等不到回包 → 报超时（见下面第二节） | `core/http.py`：秒级三级超时 + 有限重试 + **多端点自动回退**；`core/sender.py` **体积闸门**（超限不发，先自动降档） |
 | 想要语音却发来文件 | ① 下载到的其实是 HTML 错误页，被当成 mp3；② 语音环节失败后**静默降级**到 file，file 不校验内容所以「成功」了；③ 超时的连带后果 —— 语音发不出去就退到 file | `core/downloader.py` 魔数校验；`core/audio.py` 转码 + PATH 垫片；`core/sender.py` **严格语音模式，失败直接报错不降级** |
 | 同一首歌发两遍 | 会话截获的那条回复会被 AstrBot **浅复制后重新投递**、再走一遍流水线触发 LLM，LLM 于是又调了一次点歌工具（见下面第 4 节） | `main.py` 的 `should_call_llm(False)`（治本）；`core/sender.py` 的**去重窗口**（兜底） |
+| 某个音源端点挂了就整体失败 | Meting 的 search 响应**不含 `id` 字段**（ID 藏在 `url` 里），不抠出来 `Song.id` 恒为空 → 多端点回退被静默跳过，只剩一条候选地址（见第 5 节） | `core/platform/meting.py` 从 `url` 里正则抠出 ID |
 | 服务器上没法排查 | Docker 里不方便随手开终端 | `core/diagnose.py`：发「**音乐状态**」输出自检报告 |
 
 ---
@@ -157,6 +158,44 @@ RangeError: Max payload size exceeded
 > 另外 `sender.py` 里每种发送方式的失败原因现在用 **INFO** 级别记录，
 > 所以你会在日志里看到完整链路（`record_link 失败：... → record_local 发送成功`），
 > 而不是只有一个孤零零的成功 —— 这正是上面第 2 点难查的原因。
+
+### 5. 一个静默失效：Meting 不给 `id`，多端点回退形同虚设
+
+`MetingPlayer.audio_url_candidates()` 是这么写的：
+
+```python
+urls = [song.audio_url] if song.audio_url else []
+if song.id:                                  # ← 守卫
+    for base in self.cfg.source_endpoints:
+        urls.append(f"{base}?server={server}&type=url&id={song.id}")
+```
+
+思路是「同一首歌在每个端点上各生成一条取链地址，下载时逐个试」。但实测两个公共端点的
+**search 响应里根本没有 `id` 字段**（2026-10 实测）：
+
+```json
+{"name": "...", "artist": "...", "url": "https://api.qijieya.cn/meting/?server=netease&type=url&id=2652820720",
+ "pic": "...", "lrc": "..."}
+```
+
+歌曲 ID 是被塞在 **`url` 里**的。不去抠它，`Song.id` 恒为空串，`if song.id:` 永远不成立 ——
+**多端点回退一行都不会执行**，只剩 `song.audio_url` 一条候选。
+第一个端点抽风就整体失败，而你从日志上完全看不出「回退根本没跑」。
+
+修法是从 `url` 里正则抠出 ID（`core/platform/meting.py` 的 `_ID_IN_URL`），
+取值顺序为 `id` → `url_id` → 从 `url` 抠。修完实测：
+
+```
+✓ 所有歌都解析出了 id（如 2652820720）
+  audio_url_candidates 生成 3 条候选
+    - https://api.qijieya.cn/meting/?server=netease&type=url&id=2652820720
+    - https://api.i-meto.com/meting/api?server=netease&type=url&id=2652820720
+    ✓ 多端点候选回退可用（单端点抽风时能自动换）
+```
+
+> 注意第二条候选实际会返回 401（i-meto 需要 `auth` 参数，而那个参数只存在于它自己给的
+> `url` 里）。这没关系 —— 候选本来就是「逐个试，失败就下一个」，
+> 而且**排在第一位的那条正是带 `auth` 的原始地址**。这也恰好说明多候选不是多余的。
 
 ---
 
