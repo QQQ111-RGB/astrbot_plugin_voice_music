@@ -1,18 +1,26 @@
 # astrbot_plugin_voice_music · 语音点歌
 
-AstrBot 的语音点歌插件。照着 `Zhalslar/astrbot_plugin_music` 的思路重写，
-针对「**总是超时**」和「**想要语音却发来文件**」这两个高频问题做了结构性修复。
+AstrBot 的语音点歌插件。群里发一句 `点歌 晴天`，回个序号，歌就以**语音**发出来。
 
-```bash
-cd /AstrBot/data/plugins && git clone <本仓库地址> astrbot_plugin_voice_music
-```
+照着 `Zhalslar/astrbot_plugin_music` 的架构思路重写，针对「**总是超时**」和
+「**想要语音却收到文件**」这两个高频问题做了结构性修复。
 
-群里发 `点歌 晴天` → 回序号选歌 → 发出**语音**。发 `音乐状态` 可看自检报告。
+> 本 README 的部署与排查步骤按「**云服务器 + Docker**」写的。
+> 你本机有没有 ffmpeg 完全不重要 —— 相关的一切都发生在容器里。
 
-> **本 README 的排查步骤是按「云服务器 + Docker」部署写的。**
-> 你本机有没有 ffmpeg **完全不重要** —— 相关的一切都发生在容器里。
+**目录**
 
-## 这个插件的核心结论
+- [一、介绍](#一介绍)
+- [二、安装](#二安装)
+- [三、使用方法](#三使用方法)
+- [四、原理与排查（可选深读）](#四原理与排查可选深读)
+- [五、注意事项](#五注意事项)
+
+---
+
+## 一、介绍
+
+### 1. 它解决什么问题
 
 如果你只读一段，读这段：
 
@@ -20,7 +28,7 @@ cd /AstrBot/data/plugins && git clone <本仓库地址> astrbot_plugin_voice_mus
 而那个 wav 会沿用源文件的采样率。一首 4 分钟的歌 ≈ 65 MB 一帧。
 协议端（NapCat / Lagrange）的 `maxPayload` 收不下就直接断连 ——
 AstrBot 侧表现为「超时」，然后插件降级去发文件，你就收到一个文件。**
-两个症状是同一个原因。
+「超时」和「收到文件」这两个症状，其实是同一个原因。
 
 由此有两条反直觉的结论：
 
@@ -32,19 +40,312 @@ AstrBot 侧表现为「超时」，然后插件降级去发文件，你就收到
 
 本插件默认把 **`record_link`（只把直链递过去，一帧几十字节）排在第一位**，
 并在本地语音前加了一道**体积闸门**：超限先自动降到 8kHz 重转，仍超就拒绝发送并报出具体数字，
-而不是让它变成一次「超时 + 默默发个文件」。完整推演见下面第一节。
+而不是让它变成一次「超时 + 默默发个文件」。
+
+### 2. 功能特性
 
 | 你的问题 | 根因 | 本插件的对策 |
 |---|---|---|
-| 总是显示超时 | ① `aiohttp.ClientSession()` 默认总超时 **300 秒**，接口挂住就一直等；② 公共音源域名时好时坏，单点无备用；③ **语音那一条 WebSocket 帧太大，协议端直接断连**，AstrBot 等不到回包 → 报超时（见下面第二节） | `core/http.py`：秒级三级超时 + 有限重试 + **多端点自动回退**；`core/sender.py` **体积闸门**（超限不发，先自动降档） |
+| 总是显示超时 | ① `aiohttp.ClientSession()` 默认总超时 **300 秒**，接口挂住就一直等；② 公共音源域名时好时坏，单点无备用；③ **语音那一条 WebSocket 帧太大，协议端直接断连**，AstrBot 等不到回包 → 报超时（见第四节 1、3） | `core/http.py`：秒级三级超时 + 有限重试 + **多端点自动回退**；`core/sender.py` **体积闸门**（超限不发，先自动降档） |
 | 想要语音却发来文件 | ① 下载到的其实是 HTML 错误页，被当成 mp3；② 语音环节失败后**静默降级**到 file，file 不校验内容所以「成功」了；③ 超时的连带后果 —— 语音发不出去就退到 file | `core/downloader.py` 魔数校验；`core/audio.py` 转码 + PATH 垫片；`core/sender.py` **严格语音模式，失败直接报错不降级** |
-| 同一首歌发两遍 | 会话截获的那条回复会被 AstrBot **浅复制后重新投递**、再走一遍流水线触发 LLM，LLM 于是又调了一次点歌工具（见下面第 4 节） | `main.py` 的 `should_call_llm(False)`（治本）；`core/sender.py` 的**去重窗口**（兜底） |
-| 某个音源端点挂了就整体失败 | Meting 的 search 响应**不含 `id` 字段**（ID 藏在 `url` 里），不抠出来 `Song.id` 恒为空 → 多端点回退被静默跳过，只剩一条候选地址（见第 5 节） | `core/platform/meting.py` 从 `url` 里正则抠出 ID |
+| 同一首歌发两遍 | 会话截获的那条回复会被 AstrBot **浅复制后重新投递**、再走一遍流水线触发 LLM，LLM 于是又调了一次点歌工具（见第四节 4） | `main.py` 的 `should_call_llm(False)`（治本）；`core/sender.py` 的**去重窗口**（兜底） |
+| 某个音源端点挂了就整体失败 | Meting 的 search 响应**不含 `id` 字段**（ID 藏在 `url` 里），不抠出来 `Song.id` 恒为空 → 多端点回退被静默跳过，只剩一条候选地址（见第四节 5） | `core/platform/meting.py` 从 `url` 里正则抠出 ID |
 | 服务器上没法排查 | Docker 里不方便随手开终端 | `core/diagnose.py`：发「**音乐状态**」输出自检报告 |
+| 想换 / 加音源 | 原版音源写死在主流程里 | `core/platform/` 抽象基类 + 子类自动注册，加音源不用动主流程（见第三节 5） |
+
+### 3. 工作原理
+
+```
+用户: 点歌 晴天
+      │
+      ▼
+  main.py  ── 解析命令/序号 ──► 选定 player（音源）
+      │
+      ▼
+  platform.fetch_songs()          ← http.request_json_multi()：多端点回退
+      │  返回 list[Song]
+      ▼
+  未给序号 → 发候选列表 → session_waiter 等回复
+  给了序号 → 直接发
+      │
+      ▼
+  sender.send_song()
+      ├─ 去重闸门                 ← 同一会话同一首歌在窗口内只发一次
+      ├─ audio_url_candidates()   ← 同 ID × 多端点，逐个候选
+      ├─ downloader.download_audio_multi()  ← 魔数校验，非音频丢弃
+      ├─ audio.to_voice()         ← ffmpeg 转成单声道低采样率 wav
+      ├─ ★ 体积闸门：估算 base64 体积
+      │     ├─ 超限 → 自动降到 wav8k 重转一次
+      │     └─ 仍超 → 拒绝发送并说明「预计 X MB > 上限 Y MB」
+      └─ Record.fromFileSystem()  ← AstrBot 复用我们的 wav → base64 → 协议端转 SILK
+      │
+      ├─ 成功 → 发出语音
+      └─ 失败 → 报错并列出每个环节的原因（严格模式下不发文件）
+```
+
+### 4. 目录结构
+
+**仓库根目录就是插件目录**，克隆下来即可被 AstrBot 加载：
+
+```
+astrbot_plugin_voice_music/          ← 仓库根 = 插件目录，直接放进 data/plugins/
+├── metadata.yaml                    插件元信息
+├── _conf_schema.json                WebUI 配置面板定义
+├── requirements.txt                 依赖
+├── main.py                          ★ 编排：命令注册、事件监听、选歌会话、启动自检
+├── core/
+│   ├── config.py                    配置读取与自检
+│   ├── model.py                     Song / Platform 数据模型
+│   ├── http.py                      ★ 统一 HTTP：秒级超时 + 重试 + 多端点回退   → 治「超时」
+│   ├── downloader.py                ★ 下载 + 内容校验（拒绝 HTML）            → 治「下到错误页」
+│   ├── audio.py                     ★ 魔数校验 + ffmpeg 转码 + PATH 垫片       → 治「发不出语音」
+│   ├── sender.py                    ★ 发送策略：语音优先 / 体积闸门 / 去重      → 治「变文件」
+│   ├── diagnose.py                  ★ 远程自检报告                           → 治「没法排查」
+│   ├── utils.py                     参数解析（「2 语音」这类输入）
+│   └── platform/
+│       ├── base.py                  ★ BaseMusicPlayer 抽象 + 子类自动注册
+│       └── meting.py                MetingPlayer + NeteaseMeting + NeteaseWeb
+├── tools/                           部署期诊断，不参与插件运行
+│   ├── diagnose_in_container.py     ★ 容器内全量体检（8 项 PASS/FAIL，只用标准库）
+│   └── probe_min.py                 ★ 极简体检，可直接 `docker exec -i ... python -` 粘贴运行
+└── .selftest/
+    └── run_selftest.py              端到端自测（桩件模拟 AstrBot，不依赖真实 AstrBot）
+```
 
 ---
 
-## 一、根因诊断（先看这段，能省很多时间）
+## 二、安装
+
+### 1. 前置要求
+
+| 项目 | 要求 |
+|---|---|
+| AstrBot | 能正常加载插件即可 |
+| 依赖 | `aiohttp`、`aiofiles`（AstrBot 会自动装到 `data/site-packages`，容器重建不丢） |
+| ffmpeg | **强烈建议容器里有**。没有也能跑（插件会自建 PATH 垫片），见下面第 3 节 |
+
+### 2. 安装插件
+
+**方式 1：克隆到插件目录**（推荐）
+
+```bash
+cd /AstrBot/data/plugins        # 宿主机上就是 $PWD/data/plugins/
+git clone <本仓库地址> astrbot_plugin_voice_music
+```
+
+**方式 2：下载 ZIP**，解压后把整个目录放到 `AstrBot/data/plugins/astrbot_plugin_voice_music/`。
+
+**方式 3：直接从本机传上去**（Docker + 云服务器，没走 GitHub 时用这个）
+
+```bash
+# ① 本机打包（在仓库的上一级目录执行）
+tar --exclude='.git' -czf astrbot_plugin_voice_music.tar.gz astrbot_plugin_voice_music
+
+# ② 传到服务器
+scp astrbot_plugin_voice_music.tar.gz <用户>@<服务器IP>:~/
+
+# ③ 服务器上解到 AstrBot 的数据卷里（路径按你的实际情况改）
+cd /path/to/astrbot/data/plugins
+tar -xzf ~/astrbot_plugin_voice_music.tar.gz
+ls astrbot_plugin_voice_music/main.py     # 确认解出来了
+```
+
+**GitHub 不是运行条件，只是分发渠道。** 只要这个目录出现在 `data/plugins/` 下就能用。
+反过来，如果你想以后在服务器上 `git pull` 更新，那就得先推到 GitHub（私有仓库也行）再 `git clone`。
+
+装完重启容器：
+
+```bash
+docker restart <容器名>
+```
+
+### 3. 容器里没有 ffmpeg 怎么办
+
+先确认一下：
+
+```bash
+# 1) 容器里有没有 ffmpeg？（官方镜像的 Dockerfile 里是装了 ffmpeg + libavcodec-extra 的）
+docker exec -it <容器名> ffmpeg -version
+
+# 2) 如果上一条报 command not found，再看 pip 侧的情况
+docker exec -it <容器名> python -c "import astrbot; print(astrbot.__file__)"
+```
+
+- **第一条有输出** → ffmpeg 齐备，语音链路没问题，直接去验证。
+- **第一条报 not found** → 按下面任一方式补上（推荐 A）。
+
+#### 方式 A：让插件自己补上（推荐，零手工、重建容器也不丢）
+
+1. 编辑插件目录里的 `requirements.txt`，把这一行的注释去掉：
+   ```
+   imageio-ffmpeg>=0.4.9
+   ```
+2. 重启 AstrBot。插件依赖会被装到 `data/site-packages`（**在挂载卷里，容器重建后仍在**）。
+3. 插件启动时会自动做一件事：发现 PATH 上没有 `ffmpeg`，就用 imageio-ffmpeg 的二进制在
+   `data/temp/astrbot_plugin_voice_music/bin/` 下建一个名为 `ffmpeg` 的垫片，并插到本进程的 PATH 最前面。
+
+> **为什么必须建垫片？** 因为 AstrBot 内部执行的是裸命令 `ffmpeg`。
+> pip 装的 imageio-ffmpeg 里的文件叫 `ffmpeg-linux-x86_64-v7.1`，PATH 上并没有 `ffmpeg` 这个名字 ——
+> 不建垫片的话，**插件这层能转码，AstrBot 那层照样报 `ffmpeg not found`**。
+> 垫片不需要 root、不动 `/usr/local/bin`，每次启动自动重建。
+
+#### 方式 B：直接往容器里装（临时有效，重建容器会丢）
+
+```bash
+docker exec -u root <容器名> apt-get update && docker exec -u root <容器名> apt-get install -y ffmpeg
+```
+
+#### 方式 C：重建镜像（永久有效）
+
+```dockerfile
+FROM soulter/astrbot:latest
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libavcodec-extra && rm -rf /var/lib/apt/lists/*
+```
+
+#### 方式 D：把宿主机的静态 ffmpeg 挂进去
+
+```bash
+# 下载静态构建后
+docker run ... -v /opt/ffmpeg/ffmpeg:/usr/local/bin/ffmpeg:ro ...
+```
+
+### 4. 确认安装成功
+
+```bash
+# 1) 文件到位了吗
+docker exec -it <容器名> ls /AstrBot/data/plugins/astrbot_plugin_voice_music/main.py
+
+# 2) 依赖装了吗（AstrBot 通常会自动装到 data/site-packages）
+docker exec -it <容器名> python -c "import aiohttp, aiofiles; print('deps ok')"
+
+# 3) 重启后看加载日志
+docker logs <容器名> 2>&1 | grep voice_music | tail -20
+#   应该能看到「已加载音源：[...]」和「ffmpeg 就绪：...」
+```
+
+最后在群里发 **`音乐状态`**，能收到自检报告就说明整条链路通了。
+
+### 5. Docker 相关注意点
+
+- **插件目录**：`-v $PWD/data:/AstrBot/data`，插件放 `data/plugins/astrbot_plugin_voice_music/`。
+- **缓存目录**：插件把音频缓存放 `data/temp/astrbot_plugin_voice_music/audio/`，也就是**挂载卷里**，不会撑爆容器可写层。
+- **代理**：容器里的 `http://127.0.0.1:7890` 指的是容器自己，**不是宿主机**。要填宿主机上的代理得用
+  `http://172.17.0.1:7890`（默认 bridge 网关，可用 `docker network inspect bridge` 确认）或
+  `http://host.docker.internal:7890`（compose 里加 `extra_hosts`）。
+- **看日志**：`docker logs -f <容器名> 2>&1 | grep voice_music` 能看到插件的启动自检输出。
+
+---
+
+## 三、使用方法
+
+### 1. 命令
+
+| 命令 | 说明 |
+|---|---|
+| `点歌 晴天` | 用默认平台搜索，回复序号选歌 |
+| `点歌 晴天 1` | 直接选中第 1 首 |
+| `网易点歌 晴天` / `网易web 晴天` | 指定音源 |
+| `2` / `2 语音` / `2 文件` | 回复序号，可指定发送方式 |
+| `音乐状态` | 输出自检报告（ffmpeg / 端点连通性 / 缓存目录 / 发送策略） |
+
+> 命令需要**@机器人或唤醒词**触发。回复序号时不需要再 @。
+
+最基本的一条流程：
+
+```
+群里 -> 点歌 晴天
+机器人 -> 🔍 「晴天」找到 5 首，回复序号选择（60 秒内）：
+          1. 晴天 - 周杰伦  [269s]
+          2. ...
+机器人 -> （语音）
+```
+
+### 2. 配置项
+
+在 AstrBot 的 WebUI 插件配置页里改，对应 `_conf_schema.json`。
+
+| 配置项 | 默认 | 作用 |
+|---|---|---|
+| `source_endpoints` | 两个实测可用端点 | **多端点回退列表**，建议自行部署 Meting 后替换 |
+| `request_timeout` | 8 | 单次请求超时（秒） |
+| `request_retries` | 2 | 单端点重试次数 |
+| `song_limit` | 5 | 搜索返回的候选数量 |
+| `selection_timeout` | 60 | 选歌等待时长，治「点歌超时！」 |
+| `voice_strict` | `true` | **语音失败不降级成文件**，直接报错说明原因 |
+| `send_modes` | 语音链接 → 本地语音 → 文件 → 文本 | 优先级链。`record_link` 排第一是为了绕开单帧体积上限 |
+| `ffmpeg_convert` | `true` | 发送前用 ffmpeg 转码 |
+| `voice_format` | `auto` | `auto`＝`wav`(16kHz 单声道)。可选 `wav8k`（体积减半）/ `mp3`（**别配给 record_local**，会被 AstrBot 放大 5 倍） |
+| `max_payload_bytes` | `8388608`（8 MiB） | **单帧体积闸门**。超限先自动降档一次，仍超就拒绝发送并报出具体数字。填 `0` 不限制 |
+| `dedup_seconds` | `20` | **同一会话内同一首歌的去重窗口**，治「同一首歌发两遍」。填 `0` 关闭 |
+| `max_voice_seconds` | 600 | 超长音频截断，避免发送失败 |
+| `record_unsupported` | 空 | 不支持发语音的平台名单（如 `telegram`），留空表示都尝试 |
+| `proxy` | 空 | 容器里填宿主机代理要写 `http://172.17.0.1:7890` |
+| `recall_select` | `true` | 点歌成功后撤回候选列表 |
+
+### 3. 发送方式优先级
+
+`send_modes` 是一条**优先级链，任意一环失败就往后降级**。各档位含义：
+
+| 档位 | 做什么 | 一帧多大 | 备注 |
+|---|---|---|---|
+| `record_link` | 只把音频直链递给协议端，让它自己去下 | 几十字节 | **最稳，默认排第一** |
+| `record_local` | 下载 → 转码 → base64 塞进一帧发出去 | 几 MB ~ 几十 MB | 会撞协议端 `maxPayload`，见第四节 3 |
+| `file_local` | 当文件发（本地文件） | — | 不校验内容，容易「静默成功」 |
+| `file_link` | 当文件发（直链） | — | 同上 |
+| `text` | 只发一个链接 | — | 兜底 |
+
+> **想「只发语音、彻底不要文件」**：把 `send_modes` 里的 `file_local`/`file_link` 删掉，
+> 并保持 `voice_strict = true`。这样语音发不出去时会**明确报错**，而不是偷偷换成文件。
+
+### 4. 常见问题
+
+**Q：歌发出去了，但过十几二十秒又发了一遍？**
+A：AstrBot 的会话机制会把你回复的那条消息重新投递一遍、再触发一次 LLM，LLM 顺手又点了首歌。
+本插件已用 `should_call_llm(False)` + `dedup_seconds` 治住。想手动「再放一遍」，
+把 `dedup_seconds` 设成 `0`。原理见[第四节 4](#4-为什么同一首歌会发两遍)。
+
+**Q：还是收到文件，不是语音？**
+A：先发 `音乐状态` 看自检报告。按顺序检查：① 容器里 ffmpeg 是否就绪；
+② `send_modes` 里语音档有没有被文件档压在前面；③ `record_unsupported` 里有没有写你的平台名；
+④ `voice_strict` 是否为 `true`。
+
+**Q：提示「语音体积超限：预计 X MB > 上限 Y MB」？**
+A：这就是第四节 3 那个「单帧太大」的问题被提前拦下了。三个解法：
+调小 `max_voice_seconds`、把 `voice_format` 设为 `wav8k`、
+或调大 `max_payload_bytes`（前提是协议端的 `maxPayload` 也够大）。
+
+**Q：发了没反应，几分钟后才报超时？**
+A：多半是音源接口挂住（aiohttp 默认总超时 300 秒）。本插件已把它收紧到秒级并加了多端点回退。
+如果仍慢，把 `request_timeout` 调大、多配几个 `source_endpoints`；
+**境外服务器**建议加 `proxy`。详见[第四节 1](#1-总是超时的三个来源)。
+
+**Q：`点歌超时！`？**
+A：这是另一回事 —— 发出候选后 60 秒内没回序号就会取消。调 `selection_timeout` 即可。
+
+### 5. 加一个新音源（不用改主流程）
+
+```python
+# core/platform/meting.py
+class KugouMeting(MetingPlayer):
+    server: ClassVar[str] = "kugou"
+    platform: ClassVar[Platform] = Platform(
+        name="kugou", display_name="酷狗点歌", keywords=["酷狗点歌", "酷狗"]
+    )
+```
+
+然后在 `core/platform/__init__.py` 的 import 和 `__all__` 里加上类名即可 ——
+`main.py` 会通过 `BaseMusicPlayer.get_all_subclass()` 自动发现（见 `base.py` 的 `__init_subclass__`）。
+
+如果需要完全自建搜索（不走 Meting），参考 `NeteaseWeb`：覆盖 `fetch_songs()`，
+直链用 `audio_url_candidates()` 补全。
+
+---
+
+## 四、原理与排查（可选深读）
+
+这一节解释「为什么这么设计」。**平时不用读** —— 但你如果遇到怪问题，
+或者想给别的插件提 issue，这里的每一条都是核对过 AstrBot 源码 / 实测记录的。
 
 ### 1. 「总是超时」的三个来源
 
@@ -197,67 +498,7 @@ if song.id:                                  # ← 守卫
 > `url` 里）。这没关系 —— 候选本来就是「逐个试，失败就下一个」，
 > 而且**排在第一位的那条正是带 `auth` 的原始地址**。这也恰好说明多候选不是多余的。
 
----
-
-## 二、Docker 部署：先做这一步诊断
-
-```bash
-# 1) 容器里有没有 ffmpeg？（官方镜像的 Dockerfile 里是装了 ffmpeg + libavcodec-extra 的）
-docker exec -it <容器名> ffmpeg -version
-
-# 2) 如果上一条报 command not found，再看 pip 侧的情况
-docker exec -it <容器名> python -c "import astrbot; print(astrbot.__file__)"
-```
-
-- **第一条有输出** → ffmpeg 齐备，语音链路没问题，直接去装插件。
-- **第一条报 not found** → 按下面任一方式补上（推荐 A）。
-
-### 方式 A：让插件自己补上（推荐，零手工、重建容器也不丢）
-
-1. 编辑插件目录里的 `requirements.txt`，把这一行的注释去掉：
-   ```
-   imageio-ffmpeg>=0.4.9
-   ```
-2. 重启 AstrBot。插件依赖会被装到 `data/site-packages`（**在挂载卷里，容器重建后仍在**）。
-3. 插件启动时会自动做一件事：发现 PATH 上没有 `ffmpeg`，就用 imageio-ffmpeg 的二进制在
-   `data/temp/astrbot_plugin_voice_music/bin/` 下建一个名为 `ffmpeg` 的垫片，并插到本进程的 PATH 最前面。
-
-> **为什么必须建垫片？** 因为 AstrBot 内部执行的是裸命令 `ffmpeg`。
-> pip 装的 imageio-ffmpeg 里的文件叫 `ffmpeg-linux-x86_64-v7.1`，PATH 上并没有 `ffmpeg` 这个名字 ——
-> 不建垫片的话，**插件这层能转码，AstrBot 那层照样报 `ffmpeg not found`**。
-> 垫片不需要 root、不动 `/usr/local/bin`，每次启动自动重建。
-
-### 方式 B：直接往容器里装（临时有效，重建容器会丢）
-
-```bash
-docker exec -u root <容器名> apt-get update && docker exec -u root <容器名> apt-get install -y ffmpeg
-```
-
-### 方式 C：重建镜像（永久有效）
-
-```dockerfile
-FROM soulter/astrbot:latest
-USER root
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libavcodec-extra && rm -rf /var/lib/apt/lists/*
-```
-
-### 方式 D：把宿主机的静态 ffmpeg 挂进去
-
-```bash
-# 下载静态构建后
-docker run ... -v /opt/ffmpeg/ffmpeg:/usr/local/bin/ffmpeg:ro ...
-```
-
-### Docker 相关注意点
-
-- **插件目录**：`-v $PWD/data:/AstrBot/data`，插件放 `data/plugins/astrbot_plugin_voice_music/`。
-- **缓存目录**：插件把音频缓存放 `data/temp/astrbot_plugin_voice_music/audio/`，也就是**挂载卷里**，不会撑爆容器可写层。
-- **代理**：容器里的 `http://127.0.0.1:7890` 指的是容器自己，**不是宿主机**。要填宿主机上的代理得用
-  `http://172.17.0.1:7890`（默认 bridge 网关，可用 `docker network inspect bridge` 确认）或
-  `http://host.docker.internal:7890`（compose 里加 `extra_hosts`）。
-- **看日志**：`docker logs -f <容器名> 2>&1 | grep voice_music` 能看到插件的启动自检输出。
-
-### 环境体检脚本（推荐先用它定位）
+### 6. 环境体检脚本（推荐先用它定位）
 
 两个脚本都只用标准库，**不需要先装插件**：
 
@@ -322,163 +563,7 @@ docker exec -it astrbot python /AstrBot/data/diag.py
 
 **怎么读结果**：报 FAIL 的**第一项**就是根因所在，后面的 FAIL 往往只是它的连带效应。
 
----
-
-## 三、目录结构
-
-**仓库根目录就是插件目录**，克隆下来即可被 AstrBot 加载：
-
-```
-astrbot_plugin_voice_music/          ← 仓库根 = 插件目录，直接放进 data/plugins/
-├── metadata.yaml                    插件元信息
-├── _conf_schema.json                WebUI 配置面板定义
-├── requirements.txt                 依赖
-├── main.py                          ★ 编排：命令注册、事件监听、选歌会话、启动自检
-├── core/
-│   ├── config.py                    配置读取与自检
-│   ├── model.py                     Song / Platform 数据模型
-│   ├── http.py                      ★ 统一 HTTP：秒级超时 + 重试 + 多端点回退   → 治「超时」
-│   ├── downloader.py                ★ 下载 + 内容校验（拒绝 HTML）            → 治「下到错误页」
-│   ├── audio.py                     ★ 魔数校验 + ffmpeg 转码 + PATH 垫片       → 治「发不出语音」
-│   ├── sender.py                    ★ 发送策略：语音优先 / 体积闸门 / 不降级    → 治「变文件」
-│   ├── diagnose.py                  ★ 远程自检报告                           → 治「没法排查」
-│   ├── utils.py                     参数解析（「2 语音」这类输入）
-│   └── platform/
-│       ├── base.py                  ★ BaseMusicPlayer 抽象 + 子类自动注册
-│       └── meting.py                MetingPlayer + NeteaseMeting + NeteaseWeb
-├── tools/                           部署期诊断，不参与插件运行
-│   ├── diagnose_in_container.py     ★ 容器内全量体检（8 项 PASS/FAIL，只用标准库）
-│   └── probe_min.py                 ★ 极简体检，可直接 `docker exec -i ... python -` 粘贴运行
-└── .selftest/
-    └── run_selftest.py              端到端自测（桩件模拟 AstrBot，不依赖真实 AstrBot）
-```
-
-### 数据流
-
-```
-用户: 点歌 晴天
-      │
-      ▼
-  main.py  ── 解析命令/序号 ──► 选定 player（音源）
-      │
-      ▼
-  platform.fetch_songs()          ← http.request_json_multi()：多端点回退
-      │  返回 list[Song]
-      ▼
-  未给序号 → 发候选列表 → session_waiter 等回复
-  给了序号 → 直接发
-      │
-      ▼
-  sender.send_song()
-      ├─ audio_url_candidates()   ← 同 ID × 多端点，逐个候选
-      ├─ downloader.download_audio_multi()  ← 魔数校验，非音频丢弃
-      ├─ audio.to_voice()         ← ffmpeg 转成单声道低采样率 wav
-      ├─ ★ 体积闸门：估算 base64 体积
-      │     ├─ 超限 → 自动降到 wav8k 重转一次
-      │     └─ 仍超 → 拒绝发送并说明「预计 X MB > 上限 Y MB」
-      └─ Record.fromFileSystem()  ← AstrBot 复用我们的 wav → base64 → 协议端转 SILK
-      │
-      ├─ 成功 → 发出语音
-      └─ 失败 → 报错并列出每个环节的原因（严格模式下不发文件）
-```
-
-默认 `send_modes` 是 `record_link → record_local → file_local → text`：
-先用**只递 URL**的轻量方式（一帧几十字节，永不触发体积上限），不行再走本地语音。
-
----
-
-## 四、安装
-
-**方式 1：克隆到插件目录**（推荐）
-
-```bash
-cd /AstrBot/data/plugins        # 宿主机上就是 $PWD/data/plugins/
-git clone <本仓库地址> astrbot_plugin_voice_music
-```
-
-**方式 2：下载 ZIP**，解压后把整个目录放到 `AstrBot/data/plugins/astrbot_plugin_voice_music/`。
-
-**方式 3：直接从本机传上去**（Docker + 云服务器，没走 GitHub 时用这个）
-
-```bash
-# ① 本机打包（在仓库的上一级目录执行）
-tar --exclude='.git' -czf astrbot_plugin_voice_music.tar.gz astrbot_plugin_voice_music
-
-# ② 传到服务器
-scp astrbot_plugin_voice_music.tar.gz <用户>@<服务器IP>:~/
-
-# ③ 服务器上解到 AstrBot 的数据卷里（路径按你的实际情况改）
-cd /path/to/astrbot/data/plugins
-tar -xzf ~/astrbot_plugin_voice_music.tar.gz
-ls astrbot_plugin_voice_music/main.py     # 确认解出来了
-```
-
-**★ GitHub 不是运行条件，只是分发渠道。** 只要这个目录出现在 `data/plugins/` 下就能用。
-反过来，如果你想以后在服务器上 `git pull` 更新，那就得先推到 GitHub（私有仓库也行）再 `git clone`。
-
-### 装完怎么确认成功了
-
-```bash
-# 1) 文件到位了吗
-docker exec -it <容器名> ls /AstrBot/data/plugins/astrbot_plugin_voice_music/main.py
-
-# 2) 依赖装了吗（AstrBot 通常会自动装到 data/site-packages）
-docker exec -it <容器名> python -c "import aiohttp, aiofiles; print('deps ok')"
-
-# 3) 重启后看加载日志
-docker logs <容器名> 2>&1 | grep voice_music | tail -20
-#   应该能看到「已加载音源：[...]」和「ffmpeg 就绪：...」
-```
-
-最后在群里发 **`音乐状态`**，能收到自检报告就说明整条链路通了。
-
-## 五、命令
-
-| 命令 | 说明 |
-|---|---|
-| `点歌 晴天` | 用默认平台搜索，回复序号选歌 |
-| `点歌 晴天 1` | 直接选中第 1 首 |
-| `网易点歌 晴天` / `网易web 晴天` | 指定音源 |
-| `2` / `2 语音` / `2 文件` | 回复序号，可指定发送方式 |
-| `音乐状态` | 输出自检报告（ffmpeg / 端点连通性 / 缓存目录 / 发送策略） |
-
-## 六、关键配置
-
-| 配置项 | 默认 | 作用 |
-|---|---|---|
-| `source_endpoints` | 两个实测可用端点 | **多端点回退列表**，建议自行部署 Meting 后替换 |
-| `request_timeout` | 8 | 单次请求超时（秒） |
-| `request_retries` | 2 | 单端点重试次数 |
-| `selection_timeout` | 60 | 选歌等待时长，治「点歌超时！」 |
-| `voice_strict` | `true` | **语音失败不降级成文件**，直接报错说明原因 |
-| `send_modes` | 语音链接 → 本地语音 → 文件 → 文本 | 优先级链。`record_link` 排第一是为了绕开单帧体积上限 |
-| `ffmpeg_convert` | `true` | 发送前用 ffmpeg 转码 |
-| `voice_format` | `auto` | `auto`＝`wav`(16kHz 单声道)。可选 `wav8k`（体积减半）/ `mp3`（**别配给 record_local**，会被 AstrBot 放大 5 倍） |
-| `max_payload_bytes` | `8388608`（8 MiB） | **单帧体积闸门**。超限先自动降档一次，仍超就拒绝发送并报出具体数字。填 `0` 不限制 |
-| `dedup_seconds` | `20` | **同一会话内同一首歌的去重窗口**，治「同一首歌发两遍」。填 `0` 关闭 |
-| `max_voice_seconds` | 600 | 超长音频截断，避免发送失败 |
-| `proxy` | 空 | 容器里填宿主机代理要写 `http://172.17.0.1:7890` |
-
-> 想「只发语音、彻底不要文件」：把 `send_modes` 里的 `file_local`/`file_link` 删掉，保持 `voice_strict = true`。
-
-## 七、加一个新音源（不用改主流程）
-
-```python
-# core/platform/meting.py
-class KugouMeting(MetingPlayer):
-    server: ClassVar[str] = "kugou"
-    platform: ClassVar[Platform] = Platform(
-        name="kugou", display_name="酷狗点歌", keywords=["酷狗点歌", "酷狗"]
-    )
-```
-
-然后在 `core/platform/__init__.py` 的 import 和 `__all__` 里加上类名即可 ——
-`main.py` 会通过 `BaseMusicPlayer.get_all_subclass()` 自动发现（见 `base.py` 的 `__init_subclass__`）。
-
-如果需要完全自建搜索（不走 Meting），参考 `NeteaseWeb`：覆盖 `fetch_songs()`，
-直链用 `audio_url_candidates()` 补全。
-
-## 八、自测
+### 7. 自测
 
 `.selftest/run_selftest.py` 用桩件模拟 AstrBot，跑通真实链路：
 
@@ -490,10 +575,11 @@ python .selftest/run_selftest.py
 跑完会在系统临时目录 `wb_voice_music_selftest/` 留一批测试音频（几十 MB），可以随手删掉。
 它会真的联网下载音频，所以结果也受你的网络影响。
 
-已验证通过的项目：
+已验证通过的项目（共 10 组）：
 
 - 第一个端点是坏地址时，**8 秒内快速失败并回退**到备用端点（而不是挂 5 分钟）
 - 搜索解析出候选歌曲；音频下载 11MB 并通过魔数校验
+- **Meting 的 `id` 能从 `url` 里抠出来**，`audio_url_candidates()` 生成多条候选（否则多端点回退静默失效）
 - **下载 HTML 页面时被正确拒绝**（这正是原版「把错误页当 mp3 发出去」的根因）
 - `audio_url_candidates` 在首条直链指向坏端点时自动回退到第二条并下载成功
 - **ffmpeg PATH 垫片生效**：原本 `shutil.which("ffmpeg")` 为 `None`，垫片后能解析到，
@@ -506,13 +592,13 @@ python .selftest/run_selftest.py
 - **`main.py` 能被加载**：相对导入正常、命令 / 事件监听 / LLM 工具三类钩子全部注册，
   音源自动发现到 2 个，并且 `点歌 晴天 1` 与 `音乐状态` 两条命令都真跑了一遍
 - **LLM 链路已被掐掉**：`点歌` 与选歌回复都会调 `should_call_llm(False)`，
-  这是防「同一首歌发两遍」最关键的一层（第 9 条断言 `call_llm is False`）
+  这是防「同一首歌发两遍」最关键的一层（第 9 组断言 `call_llm is False`）
 - **去重闸门**：同一会话内同一首歌连发两次，第一次发出 1 条、第二次 0 条；
   换个会话点同一首则照常发出 1 条（不误伤别的群）；`dedup_seconds = 0` 时去重完全关闭
 
-> 第 9 条是专门为「部署到服务器」加的：前 8 条只覆盖 `core/`，
+> 第 9 组是专门为「部署到服务器」加的：前 8 组只覆盖 `core/`，
 > 入口文件如果装饰器签名或相对导入有问题，你在服务器上只会看到一句泛泛的加载失败。
-> 第 10 条针对的是运行期才会暴露的「同一首歌发两遍」—— 见第一节的「4. 为什么同一首歌会发两遍」。
+> 第 10 组针对的是运行期才会暴露的「同一首歌发两遍」—— 见[第四节 4](#4-为什么同一首歌会发两遍)。
 
 真实跑出来的数字（`晴天` 那首 11.2 MB 的 mp3）：
 
@@ -524,7 +610,7 @@ python .selftest/run_selftest.py
 
 ---
 
-## 九、注意事项
+## 五、注意事项
 
 - 公开音源端点随时可能失效或限速，**长期稳定请自建 [Meting-API](https://github.com/metowolf/Meting)** 并填入 `source_endpoints`。
 - 本骨架默认只带网易云两个音源（实测可用）。QQ 音乐/酷狗在公开端点上普遍返回空结果或失效直链，需要自建服务。
