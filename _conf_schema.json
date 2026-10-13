@@ -69,7 +69,7 @@
     },
     "send_modes": {
         "description": "发送方式优先级",
-        "hint": "★决定发语音还是发文件。排在前面的优先，失败自动尝试下一种。要「只发语音」就把 file_* 去掉。默认把 record_link 放第一：它只把音频直链递过去（一帧几十字节），由协议端自己去下载，不会撞上协议端的单帧体积上限；record_local 要把整首歌 base64 塞进一帧，很容易触发 NapCat 的 Max payload size exceeded，表现为超时后降级发文件",
+        "hint": "★决定发语音还是发文件。排在前面的优先，失败自动尝试下一种。★v0.3.3 默认已**去掉 record_local**：它要把整首歌 base64 塞进一条 WebSocket 帧、再由协议端整体上传，实测会把 AstrBot 的 API 调用拖到 180 秒超时后才降级发文件（用户看到的是「点歌卡三分钟 + 收到个文件」）。record_link 只递音频直链（一帧几十字节，协议端自己去下），file_local 走文件通道，两者都不会撞那条链。确实要本地语音再手工加回 record_local，并配合小体积上限",
         "type": "list",
         "options": [
             "record_link(语音链接)",
@@ -80,16 +80,26 @@
         ],
         "default": [
             "record_link(语音链接)",
-            "record_local(本地语音)",
             "file_local(本地文件)",
             "text(文本模式)"
         ]
     },
+    "send_timeout": {
+        "description": "单次发送最长等待（秒）",
+        "hint": "★治「WebSocket API call timeout（180 秒）」的关键。协议端下载直链/上传大音频时可能长时间不返回，AstrBot 会一直等到自己写死的 180 秒才报错，期间这个候选链全被卡住。这里给每种发送方式加上限，超了就主动放弃、立刻换下一种，把最坏耗时从 180 秒压到 send_timeout × 方式数。默认 25；填 0 表示不限制（等于退回旧行为）",
+        "type": "int",
+        "slider": {
+            "min": 0,
+            "max": 120,
+            "step": 5
+        },
+        "default": 25
+    },
     "voice_strict": {
         "description": "严格语音模式（不降级成文件）",
-        "hint": "★开启后：语音发送失败时直接报错并说明原因，不再静默退回发文件。排查/追求语音体验时建议开启",
+        "hint": "★开启后：候选方式会被过滤成只剩 record_*，语音发送失败时直接报错并说明原因，绝不退回发文件。⚠️ 副作用：file_local 永远不会被尝试，一旦语音路失败用户**什么也收不到**。v0.3.3 起默认关闭（失败会快速降级发文件，至少歌能听到）；追求「宁可不发也不发文件」再打开",
         "type": "bool",
-        "default": true
+        "default": false
     },
     "ffmpeg_convert": {
         "description": "发送前用 ffmpeg 转码",
@@ -116,10 +126,10 @@
         "default": "auto"
     },
     "max_payload_bytes": {
-        "description": "本地语音体积上限（字节）",
-        "hint": "★本地语音会被 AstrBot 转成 wav 再 base64 塞进一条 WebSocket 帧。超过协议端 maxPayload 时连接会被断开，AstrBot 报超时、插件降级发文件。默认 8 MiB；超限时会先自动降到 wav8k 重试一次，仍超则拒绝发送并说明原因。填 0 表示不限制",
+        "description": "本地语音体积上限（字节，按 base64 后估算）",
+        "hint": "★只影响 record_local。默认 2 MiB（v0.3.3 从 8 MiB 收紧）：这条帧要由协议端整体收下再上传给 QQ，哪怕没撞 maxPayload，上传几 MB 语音本身就是几十秒级的长任务，很容易卡到 AstrBot 的 180 秒超时。2 MiB 相当于把这个方式自动限制在 ~40 秒以内的短音频，超了就直接跳过、走 record_link/file_*。超限时会先自动降到 wav8k 重试一次，仍超则拒绝发送并说明原因。填 0 表示不限制",
         "type": "int",
-        "default": 8388608
+        "default": 2097152
     },
     "dedup_seconds": {
         "description": "同一首歌的去重窗口（秒）",

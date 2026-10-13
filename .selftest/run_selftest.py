@@ -830,6 +830,41 @@ async def main() -> int:
             print("    ✗ server 没参与签名")
             ok = False
 
+    # --- 13. 单次发送超时（send_timeout）---
+    # 背景：协议端（NapCat）下载直链 / 上传大语音时可能长时间不返回，
+    # AstrBot 的 call_action 会一直等到自己写死的 180 秒上限才报
+    # WebSocket API call timeout —— 期间用户什么都看不到，整个候选链都被卡住。
+    # send_timeout 给每种发送方式加上限，超了就主动放弃、立刻换下一种。
+    # 本组用一个「假装卡住 30 秒」的发送器验证它真的会在 ~1 秒内被打断。
+    print("\n[13] 单次发送超时（send_timeout）—— 治「180 秒才报错」")
+    to_raw = dict(raw)
+    to_raw["send_timeout"] = 1
+    to_raw["dedup_seconds"] = 0
+    to_ms = MusicSender(PluginConfig(to_raw, None), dl_replay)
+
+    async def _hang(*_a, **_k):  # 模拟「协议端拉直链卡住，永远不回包」
+        await asyncio.sleep(30)
+        return None
+
+    to_ms._record_link = _hang  # type: ignore[method-assign]
+    hang_song = Song(
+        id="2652820720", source="netease", name="晴天", artists="x",
+        audio_url="https://example.invalid/hang.mp3",
+        cover_url=None, lyrics=None, note="网易点歌",
+    )
+    ev13 = _FakeMsgEvent("点歌 晴天", umo="aiocqhttp:GroupMessage:13")
+    t13 = loop.time()
+    ok13 = await to_ms.send_song(
+        ev13, player, hang_song, modes=["record_link", "text"]
+    )
+    dt13 = loop.time() - t13
+    print(f"    record_link 挂了 30 秒，实际 {dt13:.2f}s 就返回；成功={ok13}")
+    if dt13 < 3 and ok13:
+        print("    ✓ 超时被主动打断并降级到下一种方式（不会再干等 180 秒）")
+    else:
+        print("    ✗ send_timeout 没生效（仍会一路等到 AstrBot 的 180s 上限）")
+        ok = False
+
     await plugin.terminate()
 
     await http.close()

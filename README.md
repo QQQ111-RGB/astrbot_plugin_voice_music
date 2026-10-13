@@ -8,6 +8,18 @@ AstrBot 的语音点歌插件。群里发一句 `点歌 晴天`，回个序号�
 > 本 README 的部署与排查步骤按「**云服务器 + Docker**」写的。
 > 你本机有没有 ffmpeg 完全不重要 —— 相关的一切都发生在容器里。
 
+> **v0.3.3 重要默认值变更（针对线上实测的 180 秒超时）**
+>
+> 1. `send_modes` 默认**去掉 `record_local`**（→ `record_link → file_local → text`）。
+> 2. `max_payload_bytes` 默认 **8 MiB → 2 MiB**（把本地语音自动限制在 ~40 秒内）。
+> 3. `voice_strict` 默认 **true → false**（语音失败会快速降级发文件，不再让用户什么都收不到）。
+> 4. **新增 `send_timeout`（默认 25 秒）**：给每种发送方式加最长等待，
+>    超时立刻换下一种 —— 这是把「180 秒才报错」压到「几十秒内出结果」的关键。
+> 5. 「语音」这个别名现在指向 `record_link`（同样是语音消息，但只递直链，不会撞巨型帧）；
+>    要本地那一份请用「本地语音」。
+>
+> 变更原因与排查过程见 [`CHANGELOG.md`](./CHANGELOG.md)。
+
 **目录**
 
 - [一、介绍](#一介绍)
@@ -274,11 +286,12 @@ docker logs <容器名> 2>&1 | grep voice_music | tail -20
 | `request_retries` | 2 | 单端点重试次数 |
 | `song_limit` | 5 | 搜索返回的候选数量 |
 | `selection_timeout` | 60 | 选歌等待时长，治「点歌超时！」 |
-| `voice_strict` | `true` | **语音失败不降级成文件**，直接报错说明原因 |
-| `send_modes` | 语音链接 → 本地语音 → 文件 → 文本 | 优先级链。`record_link` 排第一是为了绕开单帧体积上限 |
+| `send_timeout` | `25` | **每种发送方式的最长等待（秒）**，超了立刻放弃并换下一种。⭐ v0.3.3 新增，把最坏耗时从 AstrBot 写死的 **180 秒**压到 `send_timeout × 方式数`。填 `0` 表示不限制（退回旧行为） |
+| `voice_strict` | `false` | **语音失败不降级成文件**，直接报错说明原因。⚠️ v0.3.3 起默认 `false`：开启后候选会被过滤成只剩 `record_*`，`file_local` 永不尝试，语音一失败用户什么都收不到 |
+| `send_modes` | 语音链接 → 文件 → 文本 | 优先级链。v0.3.3 起默认**不含 `record_local`**（巨型帧那条路见第四节 3） |
 | `ffmpeg_convert` | `true` | 发送前用 ffmpeg 转码 |
 | `voice_format` | `auto` | `auto`＝`wav`(16kHz 单声道)。可选 `wav8k`（体积减半）/ `mp3`（**别配给 record_local**，会被 AstrBot 放大 5 倍） |
-| `max_payload_bytes` | `8388608`（8 MiB） | **单帧体积闸门**。超限先自动降档一次，仍超就拒绝发送并报出具体数字。填 `0` 不限制 |
+| `max_payload_bytes` | `2097152`（2 MiB） | **单帧体积闸门**（只影响 `record_local`）。v0.3.3 从 8 MiB 收紧：超限先自动降档一次，仍超就拒绝发送并报出具体数字。填 `0` 不限制 |
 | `dedup_seconds` | `20` | **同一会话内同一首歌的去重窗口**，治「同一首歌发两遍」。填 `0` 关闭 |
 | `max_voice_seconds` | 600 | 超长音频截断，避免发送失败 |
 | `record_unsupported` | 空 | 不支持发语音的平台名单（如 `telegram`），留空表示都尝试 |
@@ -292,13 +305,16 @@ docker logs <容器名> 2>&1 | grep voice_music | tail -20
 | 档位 | 做什么 | 一帧多大 | 备注 |
 |---|---|---|---|
 | `record_link` | 只把音频直链递给协议端，让它自己去下 | 几十字节 | **最稳，默认排第一** |
-| `record_local` | 下载 → 转码 → base64 塞进一帧发出去 | 几 MB ~ 几十 MB | 会撞协议端 `maxPayload`，见第四节 3 |
+| `record_local` | 下载 → 转码 → base64 塞进一帧发出去 | 几 MB ~ 几十 MB | 会撞协议端 `maxPayload`；**v0.3.3 起默认不启用**，见第四节 3 |
 | `file_local` | 当文件发（本地文件） | — | 不校验内容，容易「静默成功」 |
 | `file_link` | 当文件发（直链） | — | 同上 |
 | `text` | 只发一个链接 | — | 兜底 |
 
+> **每一次发送尝试都受 `send_timeout`（默认 25 秒）约束**：超时就主动打断、立刻换下一种。
+> 这是把「点歌卡三分钟才报 `WebSocket API call timeout`」压到「几十秒内出结果」的关键开关。
+
 > **想「只发语音、彻底不要文件」**：把 `send_modes` 里的 `file_local`/`file_link` 删掉，
-> 并保持 `voice_strict = true`。这样语音发不出去时会**明确报错**，而不是偷偷换成文件。
+> 并把 `voice_strict` 改回 `true`。这样语音发不出去时会**明确报错**，而不是偷偷换成文件。
 
 ### 4. 常见问题
 
@@ -660,10 +676,13 @@ pip install aiofiles aiohttp        # 只有这两个是自测需要的
 python .selftest/run_selftest.py
 ```
 
+> 第 4、7、8 组要验证转码与体积闸门，需要 PATH 上有 `ffmpeg`。
+> 本机没有的话装 `pip install imageio-ffmpeg` 即可 —— 插件会用它自动建一个 PATH 垫片。
+
 跑完会在系统临时目录 `wb_voice_music_selftest/` 留一批测试音频（几十 MB），可以随手删掉。
 它会真的联网下载音频，所以结果也受你的网络影响。
 
-已验证通过的项目（共 10 组）：
+已验证通过的项目（共 13 组）：
 
 - 第一个端点是坏地址时，**8 秒内快速失败并回退**到备用端点（而不是挂 5 分钟）
 - 搜索解析出候选歌曲；音频下载 11MB 并通过魔数校验
@@ -689,10 +708,14 @@ python .selftest/run_selftest.py
 - **自建端点签名**：`meting_token` 生成的 `auth` 与
   `HMAC-SHA1(token, server+type+id)` 独立复算结果一致；未配置密钥时不加 `auth`；
   端点自带查询串时用 `&` 续接（不会拼出两个 `?`）
+- **单次发送超时**：把某个发送方式做成「卡住 30 秒不回」，`send_timeout = 1` 时
+  **约 1 秒**就返回并降级到下一种 —— 证明不会再一路干等到 AstrBot 写死的 180 秒
+  （第 13 组，v0.3.3 新增）
 
 > 第 9 组是专门为「部署到服务器」加的：前 8 组只覆盖 `core/`，
 > 入口文件如果装饰器签名或相对导入有问题，你在服务器上只会看到一句泛泛的加载失败。
 > 第 10 组针对的是运行期才会暴露的「同一首歌发两遍」—— 见[第四节 4](#4-为什么同一首歌会发两遍)。
+> 第 13 组针对的是「点歌卡三分钟才报超时」—— 见 [CHANGELOG.md](./CHANGELOG.md)。
 
 真实跑出来的数字（`晴天` 那首 11.2 MB 的 mp3）：
 

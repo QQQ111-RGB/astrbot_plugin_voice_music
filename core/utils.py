@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 # 用户可用的中文/英文发送方式别名 -> 内部 mode 名
+#
+# ★ v0.3.3：把「语音」从 record_local 改成 record_link。
+#   record_link 同样是**以语音消息形式**发出去（只是把音频直链递给协议端，
+#   由它自己去下），帧只有几十字节，不会撞上「巨型帧 → 断连 → 180 秒超时」。
+#   想看/发本地那一份就用「本地语音」（record_local，会被体积闸门限制在短音频）。
 MODE_ALIAS: dict[str, str] = {
-    "语音": "record_local",
+    "语音": "record_link",
+    "语音链接": "record_link",
+    "record_link": "record_link",
     "本地语音": "record_local",
     "record": "record_local",
     "record_local": "record_local",
-    "语音链接": "record_link",
-    "record_link": "record_link",
     "文件": "file_local",
     "本地文件": "file_local",
     "file": "file_local",
@@ -20,7 +25,7 @@ MODE_ALIAS: dict[str, str] = {
     "text": "text",
 }
 
-MODE_HELP = "语音 / 语音链接 / 文件 / 文件链接 / 文本"
+MODE_HELP = "语音(=语音链接) / 本地语音 / 文件 / 文件链接 / 文本"
 
 
 def parse_index_and_modes(arg: str) -> tuple[int, list[str] | None, str | None]:

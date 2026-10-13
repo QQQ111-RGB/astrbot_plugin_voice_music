@@ -83,10 +83,23 @@ VOICE_PROFILES: dict[str, tuple[str, list[str]]] = {
 # base64 会把体积放大到 4/3
 B64_RATIO = 4 / 3
 
-# 走 record_local 时建议的上限。AstrBot 会把本地语音转成 wav 再 base64
-# 塞进**一条** WebSocket 帧，协议端 maxPayload 常见是 10~50 MB。
-# 默认按 8 MiB 卡，比常见上限留出余量（帧里还有 JSON 包装与其它消息段）。
-DEFAULT_MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
+# 走 record_local 时的体积上限（按 base64 后的估算值卡）。
+#
+# ★ v0.3.3 把默认值从 8 MiB 收紧到 2 MiB，原因（线上实测）：
+#
+#   1) record_local 的帧体积 = 我们转出的 wav 再 × 4/3，而且这**一条**帧要
+#      由协议端整体收下、再整体上传给 QQ。哪怕没撞到 NapCat 的 maxPayload，
+#      "上传一个几 MB 的语音"本身就是个几十秒到几分钟的长任务 ——
+#      AstrBot 侧等不到回包，就会报 `WebSocket API call timeout`（实测硬上限 180 秒）。
+#   2) QQ 语音消息本身就不是给「几分钟的歌」用的。4 分钟的 wav8k ≈ 3.9 MB 裸体积
+#      ≈ 5.2 MB base64，属于「能发出去也不该发」的量级。
+#
+#   所以这个上限的真实作用是：**把 record_local 自动限制在 ~40 秒以内的短音频**，
+#      超过就直接跳过、走 record_link（只递 URL）或 file_*（发文件），
+#      从而彻底避开「巨型帧 → 断连 → 180 秒超时」这条链。
+#
+#   8 MiB 那种宽松值会让插件"看起来尝试了"，实际是把用户拖进 3 分钟的超时里。
+DEFAULT_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 
 @dataclass

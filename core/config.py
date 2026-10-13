@@ -101,19 +101,56 @@ class PluginConfig:
 
     @property
     def send_modes(self) -> list[str]:
-        """默认把 record_link 排第一。
+        """默认：record_link -> file_local -> text。
 
-        原因见 core/audio.py 的算式：record_local 走的是
-        「下载 -> 转码 -> AstrBot 转 wav -> base64 -> 一条巨型 WS 帧」，
-        帧体积是几十 MB 级别，很容易撞上协议端的 maxPayload 而超时。
-        record_link 只把 URL 递过去，帧只有几十字节，由协议端自己去下，稳得多。
+        ★ v0.3.3 起**默认不再包含 record_local**。原因见 core/audio.py 的算式与
+        DEFAULT_MAX_PAYLOAD_BYTES 的注释：record_local 走的是
+        「下载 -> 转码 -> 基 64 -> 一条巨型 WS 帧 -> 协议端整体上传」，
+        帧体积是 MB 级、耗时是几十秒级，实测会把 AstrBot 的 API 调用拖到
+        180 秒超时，然后才降级发文件 —— 用户侧表现就是「点歌卡住三分钟，最后收到个文件」。
+
+        record_link 只把 URL 递过去（帧只有几十字节，由协议端自己去下），
+        file_local 走文件通道（不受单帧体积与语音时长限制），两者都不会撞那条链。
+        确实需要本地语音时，把 record_local 手工加回 send_modes 即可
+        （此时请同时把 max_payload_bytes 压到 2 MiB 以内，让超长音频被自动拦下）。
         """
         modes = self._str_list("send_modes")
-        return modes or ["record_link", "record_local", "file_local", "text"]
+        return modes or ["record_link", "file_local", "text"]
 
     @property
     def voice_strict(self) -> bool:
-        return bool(self.raw.get("voice_strict", True))
+        """严格语音模式：开启后**只**尝试 record_* 方式，语音失败不会降级发文件。
+
+        ★ v0.3.3 起默认改为 False。
+        原因：默认 True 时 send_song() 会把候选方式过滤成只剩 record_*，
+        于是 `file_local` 永远不会被尝试 —— 一旦 record_link / record_local 都失败
+        （公共音源直链不稳时很常见），用户**什么也收不到**，只看到一条报错。
+        默认 False 时失败会快速降级到发文件，至少歌能听到。
+        追求「宁可失败也不发文件」的老行为，把这一项改回 true 即可。
+        """
+        return bool(self.raw.get("voice_strict", False))
+
+    @property
+    def send_timeout(self) -> float:
+        """单次发送方式的最长等待秒数（<=0 表示不限制）。
+
+        ★ 治「180 秒超时」的关键开关。
+        协议端（NapCat）在下载直链或上传大语音时可能长时间不返回，
+        AstrBot 的 call_action 会一直等到自己写死的 180 秒上限才报
+        `WebSocket API call timeout`；期间用户什么都看不到，整个候选链也被卡住。
+
+        这里给每种发送方式加一个上限，超了就**主动放弃**并立刻尝试下一种，
+        把最坏耗时从 180 秒压到 send_timeout × 方式数。
+        默认 25 秒：足够让 record_link 这种"协议端拉个链接"的正常情况跑完。
+        """
+        value = self.raw.get("send_timeout")
+        if value is None or value == "":
+            return 25.0
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 25.0
+        return parsed if parsed > 0 else 0.0
 
     @property
     def ffmpeg_convert(self) -> bool:

@@ -8,9 +8,14 @@
 
 这里的行为：
     1. 每种发送方式都返回「失败原因」，失败原因会被收集起来一并告诉用户；
-    2. voice_strict = True 时，只保留 record_* 方式：
-       语音发不出去就直接报错并说明原因，绝不偷偷改成发文件；
-    3. 本地语音会先用 ffmpeg 统一转码，再交给协议端转 SILK。
+    2. 每种发送方式都有最长等待 send_timeout（默认 25 秒），超时就主动打断、
+       立刻换下一种 —— 这是治「点歌卡三分钟才报 WebSocket API call timeout
+       （AstrBot 写死 180 秒）」的关键（v0.3.3 新增，见 core/config.py）；
+    3. voice_strict = True 时，只保留 record_* 方式：
+       语音发不出去就直接报错并说明原因，绝不偷偷改成发文件
+       （v0.3.3 起默认 False，失败会快速降级发文件，至少歌能听到）；
+    4. 本地语音会先用 ffmpeg 统一转码，再交给协议端转 SILK；
+       发送前还会过一道体积闸门（默认 2 MiB），拦住「巨型帧 → 断连 → 180 秒超时」。
 """
 
 from __future__ import annotations
@@ -131,20 +136,34 @@ class MusicSender:
                 if retry is not None:
                     self._defer_cleanup(voice)
                     voice = retry
-                    sizes = self._payload_check(voice)
 
-            # ---- 体积闸门 2：还是超就直接不发，说明原因交给下一种发送方式 ----
-            if sizes is not None:
-                payload, readable = sizes
-                limit = self.cfg.max_payload_bytes
-                self._defer_cleanup(path, voice if voice != path else None)
-                return (
-                    f"语音体积超限：预计 {readable} > 上限 {human_size(limit)}。"
-                    "协议端会因单帧过大断开连接（NapCat 报 Max payload size exceeded），"
-                    "在 AstrBot 侧表现为超时，然后降级成发文件。"
-                    "可调小 max_voice_seconds、把 voice_format 设为 wav8k，"
-                    "或调大 max_payload_bytes（需协议端 maxPayload 也够大）"
-                )
+        # ---- 体积闸门 2（无条件生效）：还是超就直接不发，交给下一种发送方式 ----
+        # 放在 if 之外，是因为「关闭了 ffmpeg_convert」也绝不能把一条超大帧发出去。
+        sizes = self._payload_check(voice)
+        if sizes is not None:
+            _, readable = sizes
+            limit = self.cfg.max_payload_bytes
+            self._defer_cleanup(path, voice if voice != path else None)
+            return (
+                f"语音体积超限：预计 {readable} > 上限 {human_size(limit)}。"
+                "这条帧要由协议端整体收下再上传，很容易卡到 AstrBot 的 180 秒超时"
+                "（NapCat 还可能报 Max payload size exceeded 直接断连），"
+                "所以这里提前拦下、直接交给下一种发送方式。"
+                "几分钟的歌建议走 record_link / file_*；"
+                "确实要本地语音，可调小 max_voice_seconds 或把 voice_format 设为 wav8k。"
+            )
+
+        # 发送前把「这条帧到底多大」打出来：线上排查超时时，
+        # 这一行能直接告诉你当时推出去的是几百 KB 还是几 MB。
+        try:
+            raw_bytes = voice.stat().st_size
+        except OSError:
+            raw_bytes = 0
+        _, payload_readable = estimate_voice_payload(voice)
+        logger.info(
+            f"[sender] record_local 准备发送：原始 {human_size(raw_bytes)}，"
+            f"base64 后约 {payload_readable}"
+        )
 
         try:
             seg = Record.fromFileSystem(str(voice.resolve()))
@@ -340,8 +359,26 @@ class MusicSender:
             if sender is None:
                 reasons.append(f"{mode}：未知的发送方式")
                 continue
+            # ★ 单次发送的最长等待：治「180 秒超时」。
+            #   协议端下载直链 / 上传大语音时可能长时间不返回，AstrBot 会一直等到
+            #   自己写死的 180 秒上限才报 WebSocket API call timeout；
+            #   这里超时就主动放弃、立刻换下一种方式，把最坏耗时从 180s 压到
+            #   send_timeout × 方式数。见 core/config.py 的 send_timeout。
+            budget = self.cfg.send_timeout
             try:
-                reason = await sender(event, player, song)
+                if budget and budget > 0:
+                    reason = await asyncio.wait_for(
+                        sender(event, player, song), timeout=budget
+                    )
+                else:
+                    reason = await sender(event, player, song)
+            except asyncio.TimeoutError:
+                reason = (
+                    f"发送等待超过 {budget:g} 秒仍未完成 —— 协议端在下载直链/"
+                    "上传大音频时卡住了（若不打断，AstrBot 会一直等到 180 秒才报 "
+                    "WebSocket API call timeout）。已主动放弃并尝试下一种方式"
+                )
+                logger.warning(f"[sender] {mode} 超时中断：{reason}")
             except Exception as e:  # noqa: BLE001
                 logger.error(traceback.format_exc())
                 reason = f"{type(e).__name__}: {e}"
