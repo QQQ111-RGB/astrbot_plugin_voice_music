@@ -1,4 +1,4 @@
-"""AstrBot 语音点歌插件（骨架）。
+"""AstrBot 语音点歌插件。
 
 架构总览：
     main.py              —— 命令注册、事件监听、选歌会话；只做「编排」
@@ -14,19 +14,23 @@
     点歌 <歌名> [序号]        使用默认平台
     网易点歌 <歌名>           指定平台
     网易web <歌名>            指定平台
-    （发出候选后）回复「2」或「2 语音」
+    群聊发起和选择都需要当前唤醒词或真实 @；候选只属于发起人。
+    （发出候选后）用同样方式回复「2」或「2 语音」
     音乐状态                  输出自检报告
 """
 
 from __future__ import annotations
 
+import asyncio
+import time
 import traceback
+from dataclasses import dataclass
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
-from astrbot.core.utils.session_waiter import SessionController, session_waiter
+from astrbot.core.message.components import At, Plain
 
 from .core.audio import FfmpegInfo, ensure_ffmpeg_on_path
 from .core.config import PLUGIN_NAME, PluginConfig
@@ -35,11 +39,10 @@ from .core.downloader import Downloader
 from .core.http import HttpClient
 from .core.platform import BaseMusicPlayer
 from .core.sender import MusicSender
-from .core.utils import parse_index_and_modes
+from .core.utils import MODE_ALIAS, parse_index_and_modes
 
 # 命令别名（装饰器在类定义时求值，所以写死；改这里即可增删）
-# ★ 这里必须和 core/platform/ 里各音源的 keywords 对齐，否则那个平台词不会被
-#   识别成唤醒命令，「QQ点歌 晴天」这种不带 @ 的写法会直接进不来。
+# 与音源 keywords 对齐；群聊发起及选歌都要求配置的唤醒词或真实 @。
 COMMAND_ALIAS = {
     # 网易系
     "网易点歌",
@@ -54,24 +57,51 @@ STATUS_ALIAS = {"点歌诊断", "音乐诊断", "音乐状态"}
 
 
 def _no_llm(event: AstrMessageEvent) -> None:
-    """禁止这条消息再走 AstrBot 默认的 LLM 链路。
+    event.should_call_llm(False)
 
-    ★ 为什么必须有这一步（真实踩过的坑）：
 
-    AstrBot 的 session_waiter 截获一条消息后，会把它 **浅复制成一个新事件，
-    重新投递走一遍完整流水线**。那条消息同样会触发 LLM 回复 —— 而 LLM 看到的上下文是
-    「候选列表 + 用户回复的 1 语音」，它很可能判断用户想听第 1 首，
-    于是再调用一次本插件的点歌工具，**同一首歌就发了两遍**。
-    两遍的日志长得一模一样（都是 record_local 发送成功），极难定位。
+def _raw_text(event: AstrMessageEvent) -> str:
+    return "".join(c.text for c in event.get_messages() if isinstance(c, Plain)).strip()
 
-    `event.stop_event()` 挡不住这件事：它只影响后续的 listener/handler 传播，
-    LLM 请求由 `should_call_llm()` 单独控制。
-    """
-    try:
-        event.should_call_llm(False)
-    except Exception:  # noqa: BLE001
-        # 老版本 AstrBot 可能没有这个方法；退化成不做任何事，不影响主流程
-        pass
+
+def _matching_wake_prefix(event: AstrMessageEvent, prefixes=()) -> str | None:
+    messages = event.get_messages()
+    # Match AstrBot's protection against commands addressed to a different user.
+    if (not event.is_private_chat() and messages and isinstance(messages[0], At)
+            and str(messages[0].qq) not in {str(event.get_self_id()), "all"}):
+        return None
+    text = _raw_text(event)
+    return next((p for p in prefixes if text.startswith(p)), None)
+
+
+def _addressed(event: AstrMessageEvent, prefixes=()) -> bool:
+    """Only a real bot mention or configured prefix authorizes a group request."""
+    if event.is_private_chat():
+        return True
+    bot_id = str(event.get_self_id())
+    mentioned = bool(bot_id) and any(
+        isinstance(c, At) and str(c.qq) == bot_id for c in event.get_messages()
+    )
+    return mentioned or _matching_wake_prefix(event, prefixes) is not None
+
+
+def _request_text(event: AstrMessageEvent, prefixes=()) -> str:
+    text = _raw_text(event)
+    prefix = _matching_wake_prefix(event, prefixes)
+    if prefix is not None:
+        text = text[len(prefix):].strip()
+    return text.removeprefix("/").strip()
+
+
+def _session_key(event: AstrMessageEvent) -> tuple[str, str]:
+    return event.unified_msg_origin, event.get_sender_id()
+
+
+@dataclass
+class PendingSelection:
+    expires: float
+    player: object
+    songs: list | None = None
 
 
 class VoiceMusicPlugin(Star):
@@ -92,6 +122,8 @@ class VoiceMusicPlugin(Star):
         self.players: list[BaseMusicPlayer] = []
         self.keywords: list[str] = []
         self.ffmpeg: FfmpegInfo | None = None
+        self._pending: dict[tuple[str, str], PendingSelection] = {}
+        self._send_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """插件加载后：自动发现并注册所有音源；做一次环境自检。"""
@@ -124,6 +156,7 @@ class VoiceMusicPlugin(Star):
             )
 
     async def terminate(self) -> None:
+        self._pending.clear()
         for player in self.players:
             try:
                 await player.close()
@@ -160,12 +193,16 @@ class VoiceMusicPlugin(Star):
     # ------------------------------------------------------------------
     @filter.command("点歌", alias=COMMAND_ALIAS)
     async def _cmd_help(self, event: AstrMessageEvent):
-        """点歌 <歌名> [序号]。发候选后回复序号选歌，可加「语音/文件/文本」指定发送方式。"""
+        """点歌 <歌名> [序号]。群聊须使用唤醒词或 @机器人；发候选后由点歌者用相同方式回复序号选歌，可加「语音/文件/文本」指定发送方式。"""
         return
 
     @filter.command("音乐状态", alias=STATUS_ALIAS)
     async def cmd_status(self, event: AstrMessageEvent):
         """音乐状态：输出自检报告（ffmpeg / 音源端点连通性 / 缓存目录 / 发送策略）。"""
+        prefixes = self._wake_prefixes(event)
+        if not _addressed(event, prefixes):
+            return
+        _no_llm(event)
         if self.ffmpeg is None:
             self.ffmpeg = await ensure_ffmpeg_on_path(
                 self.cfg.temp_dir, self.cfg.ffmpeg_path
@@ -183,130 +220,126 @@ class VoiceMusicPlugin(Star):
     # ------------------------------------------------------------------
     # 真正的处理逻辑
     # ------------------------------------------------------------------
+    def _wake_prefixes(self, event) -> tuple[str, ...]:
+        # Resolve the current conversation's configuration, including overrides.
+        try:
+            configured = self.context.get_config(umo=event.unified_msg_origin).get("wake_prefix", [])
+        except Exception:
+            logger.warning("[voice_music] Cannot read wake prefixes; requiring an explicit mention")
+            return ()
+        if isinstance(configured, str):
+            configured = [configured]
+        if not isinstance(configured, (list, tuple)):
+            return ()
+        # Empty/whitespace prefixes must never authorize all group messages.
+        return tuple(sorted({p for p in configured if isinstance(p, str) and p.strip()}, key=len, reverse=True))
+
+    async def _send_selected(self, event, player, song, modes=None):
+        # Serialize audio preparation/sending to avoid shared cache file races.
+        async with self._send_lock:
+            return await self.sender.send_song(event, player, song, modes=modes)
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_song(self, event: AstrMessageEvent):
-        if not event.is_at_or_wake_command:
+        now = time.monotonic()
+        self._pending = {k: v for k, v in self._pending.items() if v.expires > now}
+        prefixes = self._wake_prefixes(event)
+        if not _addressed(event, prefixes):
+            return
+        text = _request_text(event, prefixes)
+        parts = text.split(maxsplit=1)
+        if not parts:
+            return
+        cmd = parts[0]
+        key = _session_key(event)
+        pending = self._pending.get(key)
+
+        # Only exact, explicit commands can start a search. No history/LLM tools.
+        if cmd not in {"点歌", *COMMAND_ALIAS}:
+            if pending is None or pending.songs is None:
+                return
+            if text in {"取消", "取消点歌"}:
+                _no_llm(event)
+                self._pending.pop(key, None)
+                yield event.plain_result("已取消本次点歌")
+                event.stop_event()
+                return
+            # Ordinary chat, extra sentences and bare numbers without @ are ignored.
+            selection_parts = text.split()
+            if not (cmd.isascii() and cmd.isdigit()) or len(selection_parts) > 2:
+                return
+            if len(selection_parts) == 2 and selection_parts[1].lower() not in MODE_ALIAS:
+                return
+            idx, modes, error = parse_index_and_modes(text)
+            _no_llm(event)
+            if error:
+                yield event.plain_result(error)
+                event.stop_event()
+                return
+            if not (1 <= idx <= len(pending.songs)):
+                yield event.plain_result(f"序号超出范围（1-{len(pending.songs)}），请重新选择")
+                event.stop_event()
+                return
+            # Claim before any await; a second reply cannot send the same selection.
+            self._pending.pop(key, None)
+            try:
+                await self._send_selected(event, pending.player, pending.songs[idx - 1], modes)
+            except Exception:
+                logger.error(traceback.format_exc())
+                yield event.plain_result("歌曲发送失败，请重新点歌或查看音乐状态")
+            finally:
+                event.stop_event()
             return
 
-        cmd, _, arg = event.message_str.partition(" ")
-        cmd, arg = cmd.strip(), arg.strip()
-        if not arg:
-            return
-
-        player = self.get_player(word=cmd)
-        if cmd == "点歌":
-            player = self.get_player(default=True)
-        if player is None:
-            return  # 不是本插件的命令，静默放过
-
-        # 确认是我们自己的命令：接管这条消息，别再让它触发 LLM
         _no_llm(event)
-
-        # 解析「歌名 + 可选尾部序号」
-        parts = arg.split()
-        index = int(parts[-1]) if parts[-1].isdigit() else 0
-        song_name = arg.removesuffix(str(index)).strip() if index else arg
-        if not song_name:
-            yield event.plain_result("未指定歌名")
-            return
-
-        logger.debug(f"[{PLUGIN_NAME}] {player.platform.display_name} 搜索：{song_name}")
-        songs = await player.fetch_songs(
-            keyword=song_name, limit=self.cfg.song_limit, extra=cmd
-        )
-        if not songs:
-            yield event.plain_result(
-                f"没搜到「{song_name}」。"
-                "常见原因：音源接口临时不可用 —— 检查 source_endpoints 是否可用，"
-                "或换一个平台试试。"
-            )
-            return
-
-        if len(songs) == 1:
-            index = 1
-
-        # 直接点了序号：立即发送
-        if index and 1 <= index <= len(songs):
-            await self.sender.send_song(event, player, songs[index - 1])
+        # A new explicit request invalidates this user's previous list immediately.
+        self._pending.pop(key, None)
+        arg = parts[1].strip() if len(parts) == 2 else ""
+        if not arg:
+            yield event.plain_result("用法：唤醒词 + 点歌 歌名；选歌：唤醒词 + 1 语音。也可用 @机器人 代替唤醒词")
             event.stop_event()
             return
-
-        # 否则列出候选，等待用户回复序号
-        lines = [
-            f"🔍 「{song_name}」找到 {len(songs)} 首，"
-            f"回复序号选择（{self.cfg.selection_timeout} 秒内）："
-        ]
-        for i, song in enumerate(songs, 1):
-            extra_txt = ""
-            if song.duration:
-                extra_txt = f"  [{song.duration // 1000}s]"
-            lines.append(f"{i}. {song.display_name()}{extra_txt}")
-        lines.append("可在序号后加发送方式，如「1 语音」")
-        yield event.plain_result("\n".join(lines))
-
-        @session_waiter(timeout=self.cfg.selection_timeout)
-        async def selection_waiter(
-            controller: SessionController, ev: AstrMessageEvent
-        ):
-            # ★ 这条消息是被会话截获的，AstrBot 之后还会把它浅复制重新投递一次
-            #   （见 _no_llm 的注释）。在这里就掐掉 LLM，否则会重复发一遍歌。
-            _no_llm(ev)
-
-            text = ev.message_str.strip()
-            # 用户又发起了新的点歌：让给新会话
-            if any(kw in text.lower() for kw in self.keywords):
-                controller.stop()
-                return
-
-            idx, modes, error = parse_index_and_modes(text)
-            if error:
-                await ev.send(ev.plain_result(error))
-                return
-            if idx == 0:
-                return
-            if not (1 <= idx <= len(songs)):
-                await ev.send(ev.plain_result(f"序号超出范围（1-{len(songs)}）"))
-                controller.stop()
-                return
-
-            controller.stop()
-            await self.sender.send_song(ev, player, songs[idx - 1], modes=modes)
-
-        try:
-            await selection_waiter(event)
-        except TimeoutError:
-            yield event.plain_result("点歌超时，已取消（可调大 selection_timeout）")
-        except Exception as e:  # noqa: BLE001
-            logger.error(traceback.format_exc())
-            logger.error(f"[{PLUGIN_NAME}] 点歌出错：{e}")
-
-        event.stop_event()
-
-    # ------------------------------------------------------------------
-    # LLM 工具：让 AI 可以自己点歌
-    # ------------------------------------------------------------------
-    @filter.llm_tool()
-    async def play_song_by_name(
-        self, event: AstrMessageEvent, song_name: str, platform: str = ""
-    ):
-        """当用户想听歌时，根据歌名（可含歌手）搜索并以语音播放。
-
-        Args:
-            song_name(string): 歌曲名称或包含歌手的关键词
-            platform(string): 可选。指定音源平台，严格匹配：网易点歌 / 网易web / QQ点歌。留空用默认平台
-        """
-        player = (
-            self.get_player(name=platform) if platform else self.get_player(default=True)
-        )
+        player = self.get_player(default=True) if cmd == "点歌" else self.get_player(word=cmd)
         if player is None:
-            return f"无可用音源：{platform}" if platform else "无可用音源"
-        songs = await player.fetch_songs(keyword=song_name, limit=1, extra=platform or None)
-        if not songs:
-            return "没找到相关歌曲"
-        ok = await self.sender.send_song(event, player, songs[0])
-        # 歌已经发出去了，就别再让 LLM 补一句「好的，这就为你播放」之类的废话，
-        # 也顺手挡掉其他插件对同一条消息的重复响应。
-        # 注意：真正防「同一首歌发两遍」的是 sender 里的去重闸门（dedup_seconds），
-        # stop_event 只作用于当前这条事件的后续 listener，挡不住被重新投递的那条。
-        event.stop_event()
-        return None if ok else "歌曲发送失败（详见聊天里的失败原因）"
+            yield event.plain_result("当前音源不可用，请查看音乐状态")
+            event.stop_event()
+            return
+        words = arg.split()
+        index = int(words[-1]) if words[-1].isascii() and words[-1].isdigit() else 0
+        song_name = " ".join(words[:-1]) if index else arg
+        if not song_name:
+            yield event.plain_result("未指定歌名")
+            event.stop_event()
+            return
+        request = PendingSelection(time.monotonic() + self.cfg.selection_timeout, player)
+        self._pending[key] = request
+        try:
+            songs = await player.fetch_songs(keyword=song_name, limit=self.cfg.song_limit, extra=cmd)
+            # Slow earlier searches cannot overwrite a newer list or resurrect an expired one.
+            if self._pending.get(key) is not request or request.expires <= time.monotonic():
+                return
+            if not songs:
+                self._pending.pop(key, None)
+                yield event.plain_result(f"没搜到「{song_name}」，请换关键词或音源重试")
+                return
+            if len(songs) == 1:
+                index = 1
+            if index and 1 <= index <= len(songs):
+                self._pending.pop(key, None)
+                await self._send_selected(event, player, songs[index - 1])
+                return
+            request.songs = songs
+            request.expires = time.monotonic() + self.cfg.selection_timeout
+            lines = [f"🔍 「{song_name}」找到 {len(songs)} 首（{self.cfg.selection_timeout} 秒内有效）："]
+            for i, song in enumerate(songs, 1):
+                duration = f"  [{song.duration // 1000}s]" if song.duration else ""
+                lines.append(f"{i}. {song.display_name()}{duration}")
+            lines.append("由点歌者使用唤醒词或 @机器人 回复「1 语音」；取消用同样方式发送「取消点歌」。私聊可直接回复。")
+            yield event.plain_result("\n".join(lines))
+        except Exception:
+            if self._pending.get(key) is request:
+                self._pending.pop(key, None)
+            logger.error(traceback.format_exc())
+            yield event.plain_result("点歌失败，请换音源重试或查看音乐状态")
+        finally:
+            event.stop_event()

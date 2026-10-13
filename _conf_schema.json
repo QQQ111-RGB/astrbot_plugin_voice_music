@@ -58,7 +58,7 @@
     },
     "selection_timeout": {
         "description": "选歌等待超时（秒）",
-        "hint": "发出候选列表后，用户在此时间内不回复序号即自动取消，避免出现「点歌超时！」",
+        "hint": "候选只对发起人在原聊天有效；群聊选歌也须唤醒词或真实 @。超过此时间自动失效。",
         "type": "int",
         "slider": {
             "min": 15,
@@ -69,7 +69,7 @@
     },
     "send_modes": {
         "description": "发送方式优先级",
-        "hint": "★决定发语音还是发文件。排在前面的优先，失败自动尝试下一种。★v0.3.3 默认已**去掉 record_local**：它要把整首歌 base64 塞进一条 WebSocket 帧、再由协议端整体上传，实测会把 AstrBot 的 API 调用拖到 180 秒超时后才降级发文件（用户看到的是「点歌卡三分钟 + 收到个文件」）。record_link 只递音频直链（一帧几十字节，协议端自己去下），file_local 走文件通道，两者都不会撞那条链。确实要本地语音再手工加回 record_local，并配合小体积上限",
+        "hint": "按顺序尝试发送方式。record_link 是 record_local 的兼容别名，也走本地安全发送。配置 OneBot 共享目录后由 NapCat 读取完整音频；否则先转 WAV 并检查 base64 大小。",
         "type": "list",
         "options": [
             "record_link(语音链接)",
@@ -86,7 +86,7 @@
     },
     "send_timeout": {
         "description": "单次发送最长等待（秒）",
-        "hint": "★治「WebSocket API call timeout（180 秒）」的关键。协议端下载直链/上传大音频时可能长时间不返回，AstrBot 会一直等到自己写死的 180 秒才报错，期间这个候选链全被卡住。这里给每种发送方式加上限，超了就主动放弃、立刻换下一种，把最坏耗时从 180 秒压到 send_timeout × 方式数。默认 25；填 0 表示不限制（等于退回旧行为）",
+        "hint": "每种发送方式的总等待上限（包含下载、转换和上传）。默认 25 秒；NapCat 完整语音建议 60 秒。0 表示不限制。超时并不保证协议端已取消发送，避免立即重复点歌。",
         "type": "int",
         "slider": {
             "min": 0,
@@ -97,13 +97,13 @@
     },
     "voice_strict": {
         "description": "严格语音模式（不降级成文件）",
-        "hint": "★开启后：候选方式会被过滤成只剩 record_*，语音发送失败时直接报错并说明原因，绝不退回发文件。⚠️ 副作用：file_local 永远不会被尝试，一旦语音路失败用户**什么也收不到**。v0.3.3 起默认关闭（失败会快速降级发文件，至少歌能听到）；追求「宁可不发也不发文件」再打开",
+        "hint": "默认关闭。开启后默认发送只尝试语音，失败报告原因；用户明确选择「文件」或「文本」仍可发送对应类型。",
         "type": "bool",
         "default": false
     },
     "ffmpeg_convert": {
         "description": "发送前用 ffmpeg 转码",
-        "hint": "★解决「语音发不出去」的关键。把下载到的音频统一成单声道低采样率 wav —— AstrBot 见到 .wav 会直接复用、不再自己转码，因此线上体积由本插件说了算",
+        "hint": "通用语音路径先转成单声道 WAV 控制体积。OneBot 共享目录路径把完整音频交给 NapCat 转换，不受本项影响。",
         "type": "bool",
         "default": true
     },
@@ -115,7 +115,7 @@
     },
     "voice_format": {
         "description": "语音转码格式",
-        "hint": "auto = wav(16kHz 单声道，推荐)。wav8k = 8kHz，体积再减半，音质发闷，直链慢或协议端上限小时用。mp3 体积小但只对 record_link / file_* 有意义 —— 走 record_local 时 AstrBot 会把它重新膨胀成 44.1kHz 立体声 wav，反而大 5 倍",
+        "hint": "仅用于通用语音转码：auto/wav=16kHz 单声道，wav8k=8kHz。mp3 交给 AstrBot Record 后可能再次展开为较大 WAV，不建议用于通用语音。OneBot 共享目录路径不使用本项。",
         "type": "string",
         "options": [
             "auto",
@@ -127,13 +127,13 @@
     },
     "max_payload_bytes": {
         "description": "本地语音体积上限（字节，按 base64 后估算）",
-        "hint": "★只影响 record_local。默认 2 MiB（v0.3.3 从 8 MiB 收紧）：这条帧要由协议端整体收下再上传给 QQ，哪怕没撞 maxPayload，上传几 MB 语音本身就是几十秒级的长任务，很容易卡到 AstrBot 的 180 秒超时。2 MiB 相当于把这个方式自动限制在 ~40 秒以内的短音频，超了就直接跳过、走 record_link/file_*。超限时会先自动降到 wav8k 重试一次，仍超则拒绝发送并说明原因。填 0 表示不限制",
+        "hint": "通用语音按 base64 估算体积，超限先尝试 wav8k，再拒绝发送。共享目录路径只检查包含文件路径的 JSON 请求大小，不按源音频大小限制。0 表示不限制。",
         "type": "int",
         "default": 2097152
     },
     "dedup_seconds": {
         "description": "同一首歌的去重窗口（秒）",
-        "hint": "★治「同一首歌发两遍」。AstrBot 的会话机制会把被截获的回复消息浅复制后重新投递一遍，那条消息仍会触发 LLM，LLM 可能又调用一次点歌工具。窗口内同会话同一首歌只发一次。填 0 关闭",
+        "hint": "同一聊天内同一首歌在窗口内只发送一次，作为重复发送的额外保护。0 关闭。本版已移除 session_waiter 和 LLM 点歌工具。",
         "type": "int",
         "slider": {
             "min": 0,
@@ -144,7 +144,7 @@
     },
     "max_voice_seconds": {
         "description": "语音最长时长（秒）",
-        "hint": "超过该时长的音频会被截断，避免超长语音发送失败。0 表示不限制",
+        "hint": "仅用于通用 WAV 转码路径，超过时截断，0 不截断。OneBot 共享目录路径始终发送完整源音频，不使用此限制。",
         "type": "int",
         "slider": {
             "min": 0,
@@ -168,6 +168,13 @@
     "recall_select": {
         "description": "点歌成功后撤回候选列表",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "兼容旧配置保留；当前独立候选实现不自动撤回候选列表。"
+    },
+    "onebot_shared_audio_root": {
+        "description": "OneBot 完整语音共享目录",
+        "type": "string",
+        "default": "",
+        "hint": "仅在 AstrBot 与 NapCat 使用相同路径挂载同一个目录时填写，例如 /AstrBot/data。启用后由 NapCat 读取完整音频并转语音，不截断，也不把音频放进 WebSocket 帧。其他部署留空。"
     }
 }

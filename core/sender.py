@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import traceback
 from collections.abc import Awaitable, Callable
@@ -89,10 +90,57 @@ class MusicSender:
     # ------------------------------------------------------------------
     # 各发送方式：成功 -> None，失败 -> 原因
     # ------------------------------------------------------------------
+    async def _record_onebot_shared(self, event, player, song, shared_root: str) -> str | None:
+        """NapCat reads the complete shared file; no WAV/base64 expansion or trimming."""
+        bot = getattr(event, "bot", None)
+        if bot is None or not callable(getattr(bot, "call_action", None)):
+            return "当前 OneBot 事件不支持原生语音接口"
+        urls = player.audio_url_candidates(song)
+        if not urls:
+            return "没有可用的音频直链"
+        path = await self.downloader.download_audio_multi(urls, headers=player.audio_headers(song))
+        if not path:
+            return "完整音频下载失败，请换音源重试"
+        try:
+            shared = Path(shared_root)
+            if not shared.is_absolute() or shared.resolve() == Path(shared.anchor):
+                return "共享音频目录配置无效，请检查音乐插件配置"
+            audio = path.resolve(strict=True)
+            if not audio.is_relative_to(shared.resolve()):
+                return "音频不在 NapCat 共享目录内，已停止发送以避免截断或大帧"
+            group_id = event.get_group_id()
+            target = str(group_id or event.get_sender_id())
+            if not target.isascii() or not target.isdigit() or int(target) <= 0:
+                return "无法确定语音发送目标"
+            action = "send_group_msg" if group_id else "send_private_msg"
+            params = {
+                "group_id" if group_id else "user_id": int(target),
+                "message": [{"type": "record", "data": {"file": audio.as_uri()}}],
+            }
+            wire_bytes = len(json.dumps({"action": action, "params": params}, ensure_ascii=False).encode())
+            if self.cfg.max_payload_bytes and wire_bytes > self.cfg.max_payload_bytes:
+                return "原生语音请求大小超限"
+            logger.info(
+                f"[sender] onebot_shared 完整语音准备发送：音频 {human_size(audio.stat().st_size)}，"
+                f"路径请求 {wire_bytes} 字节，不截断"
+            )
+            await bot.call_action(action, **params)
+            # Equivalent to AstrMessageEvent.send's successful-send bookkeeping.
+            event._has_send_oper = True
+            logger.info(f"[sender] onebot_shared 完整语音发送成功：{song.display_name()}")
+            return None
+        except Exception as e:
+            return f"完整语音发送失败：{type(e).__name__}: {e}"
+        finally:
+            self._defer_cleanup(path)
+
     async def _record_local(
         self, event: AstrMessageEvent, player: BaseMusicPlayer, song: Song
     ) -> str | None:
         """下载到本地 → ffmpeg 转码 → 以语音组件发出。"""
+        shared_root = str(self.cfg.get("onebot_shared_audio_root", "") or "").strip()
+        if shared_root and event.get_platform_name() == "aiocqhttp":
+            return await self._record_onebot_shared(event, player, song, shared_root)
         urls = player.audio_url_candidates(song)
         if not urls:
             return "没有可用的音频直链"
@@ -149,7 +197,7 @@ class MusicSender:
                 "这条帧要由协议端整体收下再上传，很容易卡到 AstrBot 的 180 秒超时"
                 "（NapCat 还可能报 Max payload size exceeded 直接断连），"
                 "所以这里提前拦下、直接交给下一种发送方式。"
-                "几分钟的歌建议走 record_link / file_*；"
+                "超长歌曲可显式选文件；"
                 "确实要本地语音，可调小 max_voice_seconds 或把 voice_format 设为 wav8k。"
             )
 
@@ -185,15 +233,8 @@ class MusicSender:
     async def _record_link(
         self, event: AstrMessageEvent, player: BaseMusicPlayer, song: Song
     ) -> str | None:
-        """把音频直链交给协议端自己去拉。快，但依赖直链对协议端可达。"""
-        if not song.audio_url:
-            return "没有音频直链"
-        try:
-            seg = Record.fromURL(song.audio_url)
-            await event.send(event.chain_result([seg]))
-        except Exception as e:  # noqa: BLE001
-            return f"语音链接发送失败：{type(e).__name__}: {e}"
-        return None
+        """Compatibility alias: use bounded local audio on AstrBot/OneBot."""
+        return await self._record_local(event, player, song)
 
     async def _file_local(
         self, event: AstrMessageEvent, player: BaseMusicPlayer, song: Song

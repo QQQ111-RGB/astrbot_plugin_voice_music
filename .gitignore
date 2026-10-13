@@ -40,3 +40,10 @@ wb_voice_music_selftest/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local credentials and deployment-only files
+.env
+.env.*
+!.env.example
+*.pem
+*.key

@@ -158,7 +158,18 @@ def install_stubs() -> None:
     comp_mod.Record = type("Record", (_Comp,), {})  # type: ignore[attr-defined]
     comp_mod.File = type("File", (_Comp,), {})  # type: ignore[attr-defined]
     comp_mod.Image = type("Image", (_Comp,), {})  # type: ignore[attr-defined]
-    comp_mod.Plain = type("Plain", (_Comp,), {})  # type: ignore[attr-defined]
+    class Plain(_Comp):
+        def __init__(self, text="", **kw):
+            super().__init__(text=text, **kw)
+            self.text = text
+
+    class At(_Comp):
+        def __init__(self, qq=None, **kw):
+            super().__init__(qq=qq, **kw)
+            self.qq = qq
+
+    comp_mod.Plain = Plain
+    comp_mod.At = At
     msg_pkg.components = comp_mod  # type: ignore[attr-defined]
 
     utils_pkg = _pkg("astrbot.core.utils")
@@ -518,8 +529,8 @@ async def main() -> int:
 
     print(f"    注册的装饰器：{REGISTERED}")
     kinds = {k for k, _ in REGISTERED}
-    if kinds == {"command", "event_message_type", "llm_tool"}:
-        print("    ✓ 命令 / 事件监听 / LLM 工具三类钩子都注册上了")
+    if kinds == {"command", "event_message_type"}:
+        print("    ✓ 命令与事件监听已注册，LLM 点歌工具已移除")
     else:
         print("    ✗ 钩子注册不全，AstrBot 里会收不到消息")
         ok = False
@@ -535,6 +546,13 @@ async def main() -> int:
             self.sent: list = []
             self.stopped = False
             self.call_llm: bool | None = None
+
+        def is_private_chat(self): return False
+        def get_self_id(self): return "BOT"
+        def get_sender_id(self): return "tester"
+        def get_messages(self):
+            from astrbot.core.message.components import At, Plain
+            return [At(qq="BOT"), Plain(self.message_str)]
 
         def should_call_llm(self, call_llm: bool) -> None:
             """记录 LLM 开关，供断言「有没有掐掉 LLM」使用。"""
@@ -558,7 +576,7 @@ async def main() -> int:
         def stop_event(self):
             self.stopped = True
 
-    plugin = main_mod.VoiceMusicPlugin(object(), dict(raw))
+    plugin = main_mod.VoiceMusicPlugin(types.SimpleNamespace(get_config=lambda **kwargs: {"wake_prefix": ["*"]}), dict(raw))
     await plugin.initialize()
     print(f"    加载后的音源：{[p.platform.display_name for p in plugin.players]}")
     if plugin.players and plugin.keywords:
